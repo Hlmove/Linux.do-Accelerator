@@ -192,6 +192,12 @@ cargo packager --release -c Packager.toml
 cargo packager -f deb --release -c Packager.toml
 ```
 
+macOS 安装提示：
+
+- 如果首次打开 `.app` 或安装 `.dmg` 后遇到系统拦截，需要去“设置 -> 隐私与安全性”里点击“允许”
+- 允许后再重新打开应用即可
+- 如果仍然打不开，可以在“隐私与安全性”页面里找到对应提示后再次确认放行
+
 ## GitHub Actions
 
 macOS 不再走本地交叉编译脚本，而是通过 GitHub Actions 原生构建：
