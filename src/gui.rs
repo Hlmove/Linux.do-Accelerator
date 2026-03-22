@@ -2,27 +2,49 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::{Duration, Instant};
+#[cfg(target_os = "linux")]
+use std::{fs::OpenOptions, io::Write};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Error, Result, bail};
 use eframe::egui::{self, FontDefinitions, FontFamily, FontId, RichText};
+#[cfg(target_os = "linux")]
+use gtk::glib::{self, ControlFlow};
+#[cfg(target_os = "windows")]
+use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+use tray_icon::TrayIcon;
+#[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
+use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
+#[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
+use tray_icon::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 
 use crate::branding;
 use crate::config::AppConfig;
 use crate::platform::run_elevated;
+#[cfg(target_os = "linux")]
+use crate::platform::spawn_detached;
+#[cfg(target_os = "windows")]
+use crate::platform::{
+    apply_app_window_icon, close_app_window, hide_app_window, restore_app_window,
+    update_windows_shortcuts_for_exe,
+};
 use crate::service;
 use crate::state::ServiceState;
+
+const APP_WINDOW_TITLE: &str = "Linux.do Accelerator";
+const APP_ID: &str = "linuxdo-accelerator";
 
 pub fn run(config_path: PathBuf) -> Result<()> {
     let native_options = eframe::NativeOptions {
         renderer: eframe::Renderer::Wgpu,
         viewport: egui::ViewportBuilder::default()
-            .with_title("Linux.do Accelerator")
-            .with_app_id("linuxdo-accelerator-ui")
-            .with_icon(branding::icon_data(128))
+            .with_title(APP_WINDOW_TITLE)
+            .with_app_id(APP_ID)
+            .with_icon(branding::icon_data(256))
             .with_inner_size([680.0, 420.0])
             .with_min_inner_size([660.0, 400.0])
             .with_max_inner_size([920.0, 680.0])
-            .with_minimize_button(true)
+            .with_minimize_button(!cfg!(target_os = "linux"))
             .with_maximize_button(false)
             .with_resizable(true),
         ..Default::default()
@@ -34,6 +56,71 @@ pub fn run(config_path: PathBuf) -> Result<()> {
         Box::new(move |cc| Ok(Box::new(AcceleratorApp::new(config_path.clone(), cc)))),
     )
     .map_err(|error| anyhow::anyhow!(error.to_string()))
+}
+
+#[cfg(target_os = "linux")]
+pub fn run_tray_shell(config_path: PathBuf) -> Result<()> {
+    log_linux_tray_event(&format!(
+        "tray-shell start config={}",
+        config_path.display()
+    ));
+    gtk::init().context("failed to initialize GTK for tray shell")?;
+
+    let menu = Menu::new();
+    let show_item = MenuItem::with_id("tray-show", "打开窗口", true, None);
+    let quit_item = MenuItem::with_id("tray-quit", "退出程序", true, None);
+    menu.append_items(&[&show_item, &PredefinedMenuItem::separator(), &quit_item])?;
+
+    let tray_icon = TrayIconBuilder::new()
+        .with_id("linuxdo-accelerator-tray-shell")
+        .with_menu(Box::new(menu))
+        .with_tooltip("Linux.do Accelerator")
+        .with_icon(tray_window_icon()?)
+        .build()
+        .context("failed to create Linux tray icon")?;
+    tray_icon
+        .set_visible(true)
+        .context("failed to show Linux tray icon")?;
+    log_linux_tray_event("tray-shell icon visible");
+
+    let (event_tx, event_rx) = mpsc::channel();
+    let show_id = show_item.id().clone();
+    let quit_id = quit_item.id().clone();
+    let config_for_timeout = config_path.clone();
+
+    let _menu_handler = MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
+        if event.id == show_id {
+            let _ = event_tx.send(TrayCommand::Restore);
+        } else if event.id == quit_id {
+            let _ = event_tx.send(TrayCommand::Quit);
+        }
+    }));
+
+    glib::timeout_add_local(Duration::from_millis(100), move || {
+        while let Ok(command) = event_rx.try_recv() {
+            match command {
+                TrayCommand::Restore => {
+                    log_linux_tray_event("tray-shell restore clicked");
+                    let _ = tray_icon.set_visible(false);
+                    let _ = spawn_linux_ui_process(&config_for_timeout);
+                    gtk::main_quit();
+                    return ControlFlow::Break;
+                }
+                TrayCommand::Quit => {
+                    log_linux_tray_event("tray-shell quit clicked");
+                    let _ = tray_icon.set_visible(false);
+                    gtk::main_quit();
+                    return ControlFlow::Break;
+                }
+            }
+        }
+
+        ControlFlow::Continue
+    });
+
+    gtk::main();
+    log_linux_tray_event("tray-shell exit");
+    Ok(())
 }
 
 struct AcceleratorApp {
@@ -49,6 +136,45 @@ struct AcceleratorApp {
     show_about: bool,
     show_config: bool,
     logo: egui::TextureHandle,
+    #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
+    tray: Option<TrayState>,
+    #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
+    tray_rx: Receiver<TrayCommand>,
+    #[cfg(target_os = "linux")]
+    hidden_to_tray: bool,
+    #[cfg(target_os = "linux")]
+    last_minimized: bool,
+    #[cfg(target_os = "macos")]
+    hidden_to_tray: bool,
+    #[cfg(target_os = "macos")]
+    last_minimized: bool,
+    #[cfg(target_os = "windows")]
+    window_handle: Option<isize>,
+    #[cfg(target_os = "windows")]
+    hidden_to_tray: bool,
+    #[cfg(target_os = "windows")]
+    last_minimized: bool,
+}
+
+#[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
+struct TrayState {
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    tray_icon: TrayIcon,
+    #[cfg(target_os = "linux")]
+    control_tx: mpsc::Sender<TrayVisibilityCommand>,
+}
+
+#[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
+enum TrayCommand {
+    Restore,
+    Quit,
+}
+
+#[cfg(target_os = "linux")]
+enum TrayVisibilityCommand {
+    Show,
+    Hide,
+    Quit,
 }
 
 impl AcceleratorApp {
@@ -58,11 +184,25 @@ impl AcceleratorApp {
 
         let config = AppConfig::load_or_create(&config_path).unwrap_or_default();
         let status = service::status(Some(config_path.clone())).unwrap_or_default();
+        #[cfg(target_os = "windows")]
+        let _ = sync_windows_shortcut_icon(&config_path);
         let logo = cc.egui_ctx.load_texture(
             "linuxdo-logo",
             branding::logo_image(96),
             egui::TextureOptions::LINEAR,
         );
+        #[cfg(target_os = "linux")]
+        let (tray, tray_rx) = build_tray_state(&cc.egui_ctx, None);
+        #[cfg(target_os = "macos")]
+        let (tray, tray_rx) = build_tray_state(&cc.egui_ctx, None);
+        #[cfg(target_os = "windows")]
+        let window_handle = capture_native_window_handle(cc);
+        #[cfg(target_os = "windows")]
+        if let Some(hwnd) = window_handle {
+            let _ = apply_app_window_icon(hwnd);
+        }
+        #[cfg(target_os = "windows")]
+        let (tray, tray_rx) = build_tray_state(&cc.egui_ctx, window_handle);
         Self {
             config_path,
             config,
@@ -76,6 +216,24 @@ impl AcceleratorApp {
             show_about: false,
             show_config: false,
             logo,
+            #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
+            tray,
+            #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
+            tray_rx,
+            #[cfg(target_os = "linux")]
+            hidden_to_tray: false,
+            #[cfg(target_os = "linux")]
+            last_minimized: false,
+            #[cfg(target_os = "macos")]
+            hidden_to_tray: false,
+            #[cfg(target_os = "macos")]
+            last_minimized: false,
+            #[cfg(target_os = "windows")]
+            window_handle,
+            #[cfg(target_os = "windows")]
+            hidden_to_tray: false,
+            #[cfg(target_os = "windows")]
+            last_minimized: false,
         }
     }
 
@@ -124,7 +282,8 @@ impl AcceleratorApp {
         let config_path = self.config_path.clone();
         let (tx, rx) = mpsc::channel();
         thread::spawn(move || {
-            let result = execute_action(&config_path, action).map_err(|error| error.to_string());
+            let result =
+                execute_action(&config_path, action).map_err(|error| format_error_chain(&error));
             let _ = tx.send(result);
         });
         self.action_rx = Some(rx);
@@ -158,6 +317,10 @@ impl AcceleratorApp {
                         }
                         Err(message) => {
                             self.optimistic_running = None;
+                            self.status.running = false;
+                            self.status.pid = None;
+                            self.status.status_text = "启动失败".to_string();
+                            self.status.last_error = Some(message.clone());
                             self.feedback = format!("操作失败: {message}");
                         }
                     }
@@ -196,10 +359,143 @@ impl AcceleratorApp {
         }
         self.status.status_text.clone()
     }
+
+    #[cfg(target_os = "windows")]
+    fn minimize_to_tray(&mut self, ctx: &egui::Context) {
+        if let Some(tray) = &self.tray {
+            let _ = tray.tray_icon.set_visible(true);
+        }
+        self.hidden_to_tray = true;
+        self.last_minimized = false;
+        self.feedback = if self.status.running {
+            "已最小化到系统托盘，后台加速仍在继续".to_string()
+        } else {
+            "已最小化到系统托盘".to_string()
+        };
+        if let Some(hwnd) = self.window_handle {
+            let _ = hide_app_window(hwnd);
+        }
+        ctx.request_repaint();
+    }
+
+    #[cfg(target_os = "linux")]
+    fn minimize_to_tray(&mut self, ctx: &egui::Context) {
+        match spawn_linux_tray_shell(&self.config_path) {
+            Ok(()) => {
+                self.hidden_to_tray = true;
+                self.last_minimized = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            Err(error) => {
+                self.feedback = format!("托盘最小化失败: {error}");
+                self.hidden_to_tray = false;
+                self.last_minimized = false;
+                ctx.request_repaint();
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn minimize_to_tray(&mut self, ctx: &egui::Context) {
+        if let Some(tray) = &self.tray {
+            let _ = tray.tray_icon.set_visible(true);
+        }
+        self.hidden_to_tray = true;
+        self.last_minimized = false;
+        self.feedback = if self.status.running {
+            "已最小化到菜单栏，后台加速仍在继续".to_string()
+        } else {
+            "已最小化到菜单栏".to_string()
+        };
+        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+        ctx.request_repaint();
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
+    fn minimize_to_tray(&mut self, ctx: &egui::Context) {
+        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+    }
+
+    #[cfg(target_os = "windows")]
+    fn restore_from_tray(&mut self, ctx: &egui::Context) {
+        self.hidden_to_tray = false;
+        self.last_minimized = true;
+        if let Some(tray) = &self.tray {
+            let _ = tray.tray_icon.set_visible(false);
+        }
+        if let Some(hwnd) = self.window_handle {
+            let _ = restore_app_window(hwnd);
+            let _ = apply_app_window_icon(hwnd);
+        }
+        ctx.request_repaint();
+    }
+
+    #[cfg(target_os = "linux")]
+    fn restore_from_tray(&mut self, ctx: &egui::Context) {
+        self.hidden_to_tray = false;
+        self.last_minimized = true;
+        if let Some(tray) = &self.tray {
+            let _ = tray.control_tx.send(TrayVisibilityCommand::Hide);
+        }
+        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        ctx.request_repaint();
+    }
+
+    #[cfg(target_os = "macos")]
+    fn restore_from_tray(&mut self, ctx: &egui::Context) {
+        self.hidden_to_tray = false;
+        self.last_minimized = true;
+        if let Some(tray) = &self.tray {
+            let _ = tray.tray_icon.set_visible(false);
+        }
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        ctx.request_repaint();
+    }
+
+    #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
+    fn poll_tray_events(&mut self, ctx: &egui::Context) {
+        while let Ok(command) = self.tray_rx.try_recv() {
+            match command {
+                TrayCommand::Restore => self.restore_from_tray(ctx),
+                TrayCommand::Quit => {
+                    #[cfg(target_os = "linux")]
+                    if let Some(tray) = &self.tray {
+                        let _ = tray.control_tx.send(TrayVisibilityCommand::Quit);
+                    }
+                    #[cfg(target_os = "windows")]
+                    if let Some(hwnd) = self.window_handle {
+                        let _ = close_app_window(hwnd);
+                    }
+                    #[cfg(target_os = "linux")]
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    #[cfg(target_os = "macos")]
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            }
+        }
+    }
+
+    #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
+    fn sync_minimize_to_tray(&mut self, ctx: &egui::Context) {
+        let minimized = ctx.input(|input| input.viewport().minimized.unwrap_or(false));
+        if minimized && !self.last_minimized && !self.hidden_to_tray {
+            self.minimize_to_tray(ctx);
+        }
+        self.last_minimized = minimized && !self.hidden_to_tray;
+    }
 }
 
 impl eframe::App for AcceleratorApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
+        {
+            self.poll_tray_events(ctx);
+            self.sync_minimize_to_tray(ctx);
+        }
+
         self.poll_action();
 
         if self.last_refresh.elapsed() >= Duration::from_secs(1) {
@@ -309,9 +605,7 @@ impl eframe::App for AcceleratorApp {
                                         )
                                         .clicked()
                                     {
-                                        ctx.send_viewport_cmd(
-                                            egui::ViewportCommand::Minimized(true),
-                                        );
+                                        self.minimize_to_tray(ctx);
                                     }
                                     if ui
                                         .add(
@@ -513,7 +807,13 @@ enum GuiAction {
 }
 
 fn execute_action(config_path: &Path, action: GuiAction) -> Result<String> {
-    let cli_binary = locate_cli_binary()?;
+    #[cfg(target_os = "macos")]
+    if matches!(action, GuiAction::Start) {
+        service::prepare_certificate(Some(config_path.to_path_buf()))
+            .with_context(|| "macOS certificate preparation failed")?;
+    }
+
+    let cli_binary = locate_action_binary()?;
     let subcommand = match action {
         GuiAction::Start => "helper-start",
         GuiAction::Stop => "helper-stop",
@@ -525,28 +825,121 @@ fn execute_action(config_path: &Path, action: GuiAction) -> Result<String> {
     ];
     run_elevated(&cli_binary, &args).with_context(|| "elevation or command execution failed")?;
 
-    Ok(match action {
-        GuiAction::Start => "加速已启动，可以直接最小化窗口".to_string(),
-        GuiAction::Stop => "加速已停止".to_string(),
-    })
+    let deadline = Instant::now() + Duration::from_secs(12);
+    loop {
+        let status = service::status(Some(config_path.to_path_buf()))?;
+        match action {
+            GuiAction::Start if status.running => {
+                return Ok("加速已启动，可以直接最小化窗口".to_string());
+            }
+            GuiAction::Stop if !status.running => {
+                return Ok("加速已停止".to_string());
+            }
+            _ => {
+                if let Some(error) = status.last_error {
+                    bail!(error);
+                }
+                if Instant::now() >= deadline {
+                    bail!(
+                        "service state did not update in time (status: {})",
+                        status.status_text
+                    );
+                }
+                thread::sleep(Duration::from_millis(200));
+            }
+        }
+    }
 }
 
-fn locate_cli_binary() -> Result<PathBuf> {
+#[cfg(target_os = "linux")]
+fn spawn_linux_tray_shell(config_path: &Path) -> Result<()> {
+    let gui_binary = locate_gui_binary()?;
+    let args = vec![
+        "--config".to_string(),
+        config_path.to_string_lossy().into_owned(),
+        "tray-shell".to_string(),
+    ];
+    log_linux_tray_event(&format!(
+        "spawn tray-shell exe={} config={}",
+        gui_binary.display(),
+        config_path.display()
+    ));
+    spawn_detached(&gui_binary, &args).context("failed to start Linux tray shell")?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn spawn_linux_ui_process(config_path: &Path) -> Result<()> {
+    let gui_binary = locate_gui_binary()?;
+    let args = vec![
+        "--config".to_string(),
+        config_path.to_string_lossy().into_owned(),
+        "gui".to_string(),
+    ];
+    log_linux_tray_event(&format!(
+        "spawn ui exe={} config={}",
+        gui_binary.display(),
+        config_path.display()
+    ));
+    spawn_detached(&gui_binary, &args).context("failed to reopen Linux UI")?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn log_linux_tray_event(message: &str) {
+    let path = std::env::temp_dir().join("linuxdo-tray.log");
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(file, "{message}");
+    }
+}
+
+fn locate_action_binary() -> Result<PathBuf> {
+    locate_current_or_sibling_binary(action_binary_name())
+}
+
+fn locate_gui_binary() -> Result<PathBuf> {
+    locate_current_or_sibling_binary(gui_binary_name())
+}
+
+fn locate_current_or_sibling_binary(binary_name: &str) -> Result<PathBuf> {
     let current = std::env::current_exe().context("failed to locate current executable")?;
-    let sibling = current.with_file_name(cli_binary_name());
+    if current
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name == binary_name)
+    {
+        return Ok(current);
+    }
+
+    let sibling = current.with_file_name(binary_name);
     if sibling.exists() {
         return Ok(sibling);
     }
 
-    bail!("failed to locate CLI binary {}", sibling.display())
+    bail!("failed to locate binary {}", sibling.display())
 }
 
-fn cli_binary_name() -> &'static str {
+fn action_binary_name() -> &'static str {
     if cfg!(target_os = "windows") {
         "linuxdo-accelerator.exe"
     } else {
         "linuxdo-accelerator"
     }
+}
+
+fn gui_binary_name() -> &'static str {
+    action_binary_name()
+}
+
+fn format_error_chain(error: &Error) -> String {
+    let mut lines = Vec::new();
+    for cause in error.chain() {
+        let message = cause.to_string();
+        if lines.last() != Some(&message) {
+            lines.push(message);
+        }
+    }
+    lines.join("\ncaused by: ")
 }
 
 fn install_fonts(ctx: &egui::Context) {
@@ -645,4 +1038,197 @@ fn compact_row(ui: &mut egui::Ui, label: &str, value: &str) {
                 .color(egui::Color32::from_rgb(224, 227, 230)),
         );
     });
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+fn build_tray_state(
+    ctx: &egui::Context,
+    window_handle: Option<isize>,
+) -> (Option<TrayState>, Receiver<TrayCommand>) {
+    let (tx, rx) = mpsc::channel();
+    let menu = Menu::new();
+    let show_item = MenuItem::with_id("tray-show", "打开窗口", true, None);
+    let quit_item = MenuItem::with_id("tray-quit", "退出程序", true, None);
+    let tx_tray_click = tx.clone();
+    let tx_menu = tx.clone();
+    let ctx_tray_click = ctx.clone();
+    let ctx_menu = ctx.clone();
+    TrayIconEvent::set_event_handler(Some(move |event| match event {
+        TrayIconEvent::Click {
+            button: MouseButton::Left,
+            button_state: MouseButtonState::Up,
+            ..
+        }
+        | TrayIconEvent::DoubleClick {
+            button: MouseButton::Left,
+            ..
+        } => {
+            let _ = tx_tray_click.send(TrayCommand::Restore);
+            #[cfg(target_os = "windows")]
+            if let Some(hwnd) = window_handle {
+                let _ = restore_app_window(hwnd);
+                let _ = apply_app_window_icon(hwnd);
+            }
+            ctx_tray_click.request_repaint();
+        }
+        _ => {}
+    }));
+    let show_id = show_item.id().clone();
+    let quit_id = quit_item.id().clone();
+    MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
+        if event.id == show_id {
+            let _ = tx_menu.send(TrayCommand::Restore);
+            #[cfg(target_os = "windows")]
+            if let Some(hwnd) = window_handle {
+                let _ = restore_app_window(hwnd);
+                let _ = apply_app_window_icon(hwnd);
+            }
+            ctx_menu.request_repaint();
+        } else if event.id == quit_id {
+            let _ = tx_menu.send(TrayCommand::Quit);
+            #[cfg(target_os = "windows")]
+            if let Some(hwnd) = window_handle {
+                let _ = close_app_window(hwnd);
+            }
+            ctx_menu.request_repaint();
+        }
+    }));
+
+    let result = (|| -> Result<TrayState> {
+        menu.append_items(&[&show_item, &PredefinedMenuItem::separator(), &quit_item])?;
+
+        let tray_icon = TrayIconBuilder::new()
+            .with_id("linuxdo-accelerator-tray")
+            .with_menu(Box::new(menu))
+            .with_menu_on_left_click(false)
+            .with_tooltip("Linux.do Accelerator")
+            .with_icon(tray_window_icon()?)
+            .build()
+            .context("failed to create desktop tray icon")?;
+        tray_icon
+            .set_visible(false)
+            .context("failed to hide desktop tray icon")?;
+
+        Ok(TrayState { tray_icon })
+    })();
+
+    (result.ok(), rx)
+}
+
+#[cfg(target_os = "linux")]
+fn build_tray_state(
+    ctx: &egui::Context,
+    _window_handle: Option<isize>,
+) -> (Option<TrayState>, Receiver<TrayCommand>) {
+    let (event_tx, event_rx) = mpsc::channel();
+    let (control_tx, control_rx) = mpsc::channel();
+    let ctx_menu = ctx.clone();
+    let ctx_tray = ctx.clone();
+
+    thread::spawn(move || {
+        if gtk::init().is_err() {
+            return;
+        }
+
+        let menu = Menu::new();
+        let show_item = MenuItem::with_id("tray-show", "打开窗口", true, None);
+        let quit_item = MenuItem::with_id("tray-quit", "退出程序", true, None);
+        if menu
+            .append_items(&[&show_item, &PredefinedMenuItem::separator(), &quit_item])
+            .is_err()
+        {
+            return;
+        }
+
+        let tray_icon = match tray_window_icon() {
+            Ok(icon) => TrayIconBuilder::new()
+                .with_id("linuxdo-accelerator-tray")
+                .with_menu(Box::new(menu))
+                .with_tooltip("Linux.do Accelerator")
+                .with_icon(icon)
+                .build()
+                .ok(),
+            Err(_) => None,
+        };
+
+        let Some(tray_icon) = tray_icon else {
+            return;
+        };
+        let _ = tray_icon.set_visible(false);
+
+        let show_id = show_item.id().clone();
+        let quit_id = quit_item.id().clone();
+        let event_tx_menu = event_tx.clone();
+        let _menu_handler = MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
+            if event.id == show_id {
+                let _ = event_tx_menu.send(TrayCommand::Restore);
+                ctx_menu.request_repaint();
+            } else if event.id == quit_id {
+                let _ = event_tx_menu.send(TrayCommand::Quit);
+                ctx_menu.request_repaint();
+            }
+        }));
+
+        let event_tx_tray = event_tx.clone();
+        let _tray_handler = TrayIconEvent::set_event_handler(Some(move |event| match event {
+            TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            }
+            | TrayIconEvent::DoubleClick {
+                button: MouseButton::Left,
+                ..
+            } => {
+                let _ = event_tx_tray.send(TrayCommand::Restore);
+                ctx_tray.request_repaint();
+            }
+            _ => {}
+        }));
+
+        glib::timeout_add_local(Duration::from_millis(100), move || {
+            while let Ok(command) = control_rx.try_recv() {
+                match command {
+                    TrayVisibilityCommand::Show => {
+                        let _ = tray_icon.set_visible(true);
+                    }
+                    TrayVisibilityCommand::Hide => {
+                        let _ = tray_icon.set_visible(false);
+                    }
+                    TrayVisibilityCommand::Quit => {
+                        let _ = tray_icon.set_visible(false);
+                        gtk::main_quit();
+                        return ControlFlow::Break;
+                    }
+                }
+            }
+            ControlFlow::Continue
+        });
+
+        gtk::main();
+    });
+
+    (Some(TrayState { control_tx }), event_rx)
+}
+
+#[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
+fn tray_window_icon() -> Result<tray_icon::Icon> {
+    let icon = branding::icon_data(64);
+    tray_icon::Icon::from_rgba(icon.rgba, icon.width, icon.height)
+        .map_err(|error| anyhow::anyhow!(error.to_string()))
+}
+
+#[cfg(target_os = "windows")]
+fn capture_native_window_handle(cc: &eframe::CreationContext<'_>) -> Option<isize> {
+    match cc.window_handle().ok()?.as_raw() {
+        RawWindowHandle::Win32(handle) => Some(handle.hwnd.get()),
+        _ => None,
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn sync_windows_shortcut_icon(config_path: &Path) -> Result<()> {
+    let _ = config_path;
+    let current_exe = std::env::current_exe().context("failed to locate current executable")?;
+    update_windows_shortcuts_for_exe(&current_exe)
 }

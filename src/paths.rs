@@ -20,6 +20,7 @@ pub struct AppPaths {
 impl AppPaths {
     pub fn resolve(config_override: Option<PathBuf>) -> Result<Self> {
         let (default_config_dir, default_data_dir) = default_app_dirs()?;
+        let has_config_override = config_override.is_some();
         let config_path =
             config_override.unwrap_or_else(|| default_config_dir.join("linuxdo-accelerator.toml"));
         let config_dir = config_path
@@ -27,7 +28,23 @@ impl AppPaths {
             .map(Path::to_path_buf)
             .ok_or_else(|| anyhow!("invalid config path {}", config_path.display()))?;
 
-        let data_dir = default_data_dir;
+        let data_dir = if has_config_override {
+            if config_dir
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(|name| name.eq_ignore_ascii_case("config"))
+                .unwrap_or(false)
+            {
+                config_dir
+                    .parent()
+                    .map(|root| root.join("data"))
+                    .unwrap_or_else(|| default_data_dir.clone())
+            } else {
+                config_dir.clone()
+            }
+        } else {
+            default_data_dir
+        };
         let runtime_dir = data_dir.join("runtime");
         let cert_dir = data_dir.join("certs");
         let state_path = runtime_dir.join("service-state.json");

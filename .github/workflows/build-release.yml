@@ -49,8 +49,8 @@ jobs:
       - name: Install cargo-packager
         run: cargo install cargo-packager --locked
 
-      - name: Build binaries
-        run: cargo build --release --bins
+      - name: Build binary
+        run: cargo build --release --bin linuxdo-accelerator
 
       - name: Package app
         run: ${{ matrix.package_cmd }}

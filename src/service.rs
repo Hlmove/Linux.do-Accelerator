@@ -38,6 +38,14 @@ pub fn setup(config_path: Option<PathBuf>) -> Result<()> {
     Ok(())
 }
 
+pub fn prepare_certificate(config_path: Option<PathBuf>) -> Result<()> {
+    let paths = resolve_paths(config_path)?;
+    let config = AppConfig::load_or_create(&paths.config_path)?;
+    let bundle = ensure_bundle(&config, &paths.cert_dir)?;
+    install_ca(&bundle.ca_cert_path, &config.ca_common_name)?;
+    Ok(())
+}
+
 pub async fn run_foreground(config_path: Option<PathBuf>, with_setup: bool) -> Result<()> {
     let paths = resolve_paths(config_path)?;
     let config = AppConfig::load_or_create(&paths.config_path)?;
@@ -79,7 +87,10 @@ pub fn helper_start(config_path: Option<PathBuf>) -> Result<()> {
     }
 
     let bundle = ensure_bundle(&config, &paths.cert_dir)?;
+    #[cfg(not(target_os = "macos"))]
     install_ca(&bundle.ca_cert_path, &config.ca_common_name)?;
+    #[cfg(target_os = "macos")]
+    let _ = bundle;
     apply_hosts(&config)?;
     state::mark_starting(&paths)?;
 
@@ -90,7 +101,8 @@ pub fn helper_start(config_path: Option<PathBuf>) -> Result<()> {
             paths.config_path.to_string_lossy().into_owned(),
             "daemon".to_string(),
         ];
-        spawn_detached(&cli_binary, &args)?;
+        let child_pid = spawn_detached(&cli_binary, &args)?;
+        state::write_pid(&paths, child_pid)?;
 
         wait_until_running(&paths, Duration::from_secs(10))?;
         thread::sleep(Duration::from_millis(800));

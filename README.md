@@ -12,9 +12,9 @@
 ## 二进制结构
 
 - `linuxdo-accelerator`
-  - CLI 版本
-- `linuxdo-accelerator-ui`
-  - 原生桌面 GUI 版本
+  - 单一二进制，同时支持 CLI 和原生桌面 GUI
+  - 无参数时打开 GUI
+  - 传入子命令时按 CLI 模式运行
   - Windows 双击打开弹窗
   - Linux 安装后可从桌面入口打开
   - macOS 可打包为 `.dmg`
@@ -62,7 +62,7 @@ cargo run --bin linuxdo-accelerator -- status
 ## GUI 开发运行
 
 ```bash
-cargo run --bin linuxdo-accelerator-ui
+cargo run --bin linuxdo-accelerator
 ```
 
 ## 打包
@@ -77,19 +77,19 @@ cargo run --bin linuxdo-accelerator-ui
 
 ```bash
 cargo install cargo-packager --locked
-cargo packager --release
+cargo packager --release -c Packager.toml
 ```
 
 只打 Linux `deb`：
 
 ```bash
-cargo packager -f deb --release
+cargo packager -f deb --release -c Packager.toml
 ```
 
 当前本机已经验证可以产出：
 
 ```text
-dist/linuxdo-accelerator-ui_0.1.0_amd64.deb
+dist/linuxdo-accelerator_0.1.0_amd64.deb
 ```
 
 macOS 不再走本地交叉编译脚本，改为使用 GitHub Actions 工作流 [.github/workflows/build-release.yml](/home/catcatyu/桌面/linuxdo/.github/workflows/build-release.yml) 在 `macos-latest` runner 上原生构建 `.dmg`。

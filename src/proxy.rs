@@ -1,8 +1,10 @@
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::fs::File;
 use std::io::BufReader;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
@@ -21,6 +23,7 @@ use rustls::crypto::{aws_lc_rs, ring};
 use rustls::pki_types::{EchConfigListBytes, ServerName};
 use serde::Deserialize;
 use tokio::net::TcpListener;
+use tokio::sync::RwLock;
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::TlsConnector;
 use tokio_rustls::client::TlsStream;
@@ -33,15 +36,28 @@ use tokio_rustls::rustls::{ClientConfig, DigitallySignedStruct, Error as RustlsE
 use crate::certs::CertificateBundle;
 use crate::config::AppConfig;
 
-#[derive(Clone)]
 struct AppState {
     config: AppConfig,
+    doh_client: Client,
+    resolve_cache: RwLock<HashMap<ResolveCacheKey, CachedResolvedUpstream>>,
 }
 
 #[derive(Clone, Debug)]
 struct ResolvedUpstream {
     addrs: Vec<SocketAddr>,
     ech_config: Option<EchConfig>,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+struct ResolveCacheKey {
+    host: String,
+    port: u16,
+}
+
+#[derive(Clone)]
+struct CachedResolvedUpstream {
+    upstream: ResolvedUpstream,
+    expires_at: Instant,
 }
 
 #[derive(Debug, Default)]
@@ -67,8 +83,20 @@ struct DohAnswer {
     data: String,
 }
 
+const RESOLVE_CACHE_TTL: Duration = Duration::from_secs(300);
+
 pub async fn run_proxy(config: AppConfig, bundle: CertificateBundle) -> Result<()> {
-    let state = Arc::new(AppState { config });
+    let doh_client = Client::builder()
+        .http1_only()
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(15))
+        .build()
+        .context("failed to build DoH client")?;
+    let state = Arc::new(AppState {
+        config,
+        doh_client,
+        resolve_cache: RwLock::new(HashMap::new()),
+    });
     let http_state = state.clone();
     let https_state = state.clone();
 
@@ -239,7 +267,7 @@ async fn forward_request(
         .to_bytes();
 
     let upstream_response = dispatch_upstream_request(
-        &state.config,
+        state,
         &upstream_scheme,
         request_host,
         upstream_port,
@@ -273,7 +301,7 @@ async fn forward_request(
 }
 
 async fn dispatch_upstream_request(
-    config: &AppConfig,
+    state: &AppState,
     upstream_scheme: &str,
     request_host: &str,
     upstream_port: u16,
@@ -282,7 +310,7 @@ async fn dispatch_upstream_request(
     body: Bytes,
     path_and_query: &str,
 ) -> Result<Response<Incoming>> {
-    let upstream = resolve_upstream(config, request_host, upstream_port).await?;
+    let upstream = resolve_upstream(state, request_host, upstream_port).await?;
     let mut last_error = None;
 
     if upstream.ech_config.is_some() {
@@ -311,7 +339,7 @@ async fn dispatch_upstream_request(
         }
     }
 
-    let sni_candidates = effective_fake_sni_candidates(config);
+    let sni_candidates = effective_fake_sni_candidates(&state.config);
     for sni_name in sni_candidates {
         for addr in upstream.addrs.iter().copied() {
             match send_once(
@@ -453,7 +481,7 @@ async fn connect_tcp(addr: SocketAddr) -> Result<tokio::net::TcpStream> {
     .with_context(|| format!("failed to connect upstream {addr}"))
 }
 
-async fn resolve_upstream(config: &AppConfig, host: &str, port: u16) -> Result<ResolvedUpstream> {
+async fn resolve_upstream(state: &AppState, host: &str, port: u16) -> Result<ResolvedUpstream> {
     if let Ok(ip) = host.parse::<IpAddr>() {
         return Ok(ResolvedUpstream {
             addrs: vec![SocketAddr::new(ip, port)],
@@ -461,24 +489,35 @@ async fn resolve_upstream(config: &AppConfig, host: &str, port: u16) -> Result<R
         });
     }
 
-    let binding = resolve_https_binding(config, host).await?;
+    let cache_key = ResolveCacheKey {
+        host: host.to_ascii_lowercase(),
+        port,
+    };
+    if let Some(cached) = read_cached_upstream(state, &cache_key).await {
+        return Ok(cached);
+    }
+
+    let binding = resolve_https_binding(state, host).await?;
     let target_host = binding
         .target_name
         .clone()
         .filter(|name| !name.is_empty())
         .unwrap_or_else(|| host.to_string());
 
-    let mut ips = doh_lookup_ip_addrs(config, &target_host).await?;
-    if let Some(public_name) = binding
+    let public_name = binding
         .ech_public_name
         .as_ref()
         .filter(|name| *name != &target_host)
-    {
-        match doh_lookup_ip_addrs(config, public_name).await {
-            Ok(extra_ips) => ips.extend(extra_ips),
-            Err(error) => eprintln!("failed to resolve ECH public name {public_name}: {error:#}"),
+        .cloned();
+    let public_lookup = async {
+        if let Some(public_name) = public_name.as_deref() {
+            return doh_lookup_ip_addrs(state, public_name).await;
         }
-    }
+        Ok(Vec::new())
+    };
+    let (mut ips, extra_ips) =
+        tokio::try_join!(doh_lookup_ip_addrs(state, &target_host), public_lookup)?;
+    ips.extend(extra_ips);
 
     if ips.is_empty() {
         anyhow::bail!("upstream host {target_host} resolved to no addresses");
@@ -511,19 +550,24 @@ async fn resolve_upstream(config: &AppConfig, host: &str, port: u16) -> Result<R
         .into_iter()
         .map(|ip| SocketAddr::new(ip, port))
         .collect::<Vec<_>>();
-    Ok(ResolvedUpstream { addrs, ech_config })
+    let upstream = ResolvedUpstream { addrs, ech_config };
+    write_cached_upstream(state, cache_key, upstream.clone()).await;
+    Ok(upstream)
 }
 
-async fn resolve_https_binding(config: &AppConfig, host: &str) -> Result<HttpsServiceBinding> {
-    let mut bindings = doh_lookup_https_bindings(config, host).await?;
+async fn resolve_https_binding(state: &AppState, host: &str) -> Result<HttpsServiceBinding> {
+    let mut bindings = doh_lookup_https_bindings(state, host).await?;
     bindings.sort_by_key(|binding| binding.priority);
     Ok(bindings.into_iter().next().unwrap_or_default())
 }
 
-async fn doh_lookup_ip_addrs(config: &AppConfig, host: &str) -> Result<Vec<IpAddr>> {
+async fn doh_lookup_ip_addrs(state: &AppState, host: &str) -> Result<Vec<IpAddr>> {
     let mut addrs = Vec::new();
 
-    for answer in doh_query(config, host, "AAAA").await? {
+    let (ipv6_answers, ipv4_answers) =
+        tokio::try_join!(doh_query(state, host, "AAAA"), doh_query(state, host, "A"))?;
+
+    for answer in ipv6_answers {
         if answer.record_type == 28
             && let Ok(ip) = answer.data.parse::<std::net::Ipv6Addr>()
         {
@@ -531,7 +575,7 @@ async fn doh_lookup_ip_addrs(config: &AppConfig, host: &str) -> Result<Vec<IpAdd
         }
     }
 
-    for answer in doh_query(config, host, "A").await? {
+    for answer in ipv4_answers {
         if answer.record_type == 1
             && let Ok(ip) = answer.data.parse::<std::net::Ipv4Addr>()
         {
@@ -543,12 +587,12 @@ async fn doh_lookup_ip_addrs(config: &AppConfig, host: &str) -> Result<Vec<IpAdd
 }
 
 async fn doh_lookup_https_bindings(
-    config: &AppConfig,
+    state: &AppState,
     host: &str,
 ) -> Result<Vec<HttpsServiceBinding>> {
     let mut bindings = Vec::new();
 
-    for answer in doh_query(config, host, "HTTPS").await? {
+    for answer in doh_query(state, host, "HTTPS").await? {
         if answer.record_type != 65 {
             continue;
         }
@@ -562,23 +606,39 @@ async fn doh_lookup_https_bindings(
     Ok(bindings)
 }
 
-async fn doh_query(config: &AppConfig, host: &str, record_type: &str) -> Result<Vec<DohAnswer>> {
-    let client = Client::builder()
-        .http1_only()
-        .connect_timeout(std::time::Duration::from_secs(10))
-        .timeout(std::time::Duration::from_secs(15))
-        .build()
-        .context("failed to build DoH client")?;
-
+async fn doh_query(state: &AppState, host: &str, record_type: &str) -> Result<Vec<DohAnswer>> {
     let mut last_error = None;
-    for endpoint in &config.doh_endpoints {
-        match doh_query_once(&client, endpoint, host, record_type).await {
+    for endpoint in &state.config.doh_endpoints {
+        match doh_query_once(&state.doh_client, endpoint, host, record_type).await {
             Ok(answers) => return Ok(answers),
             Err(error) => last_error = Some(error),
         }
     }
 
     Err(last_error.unwrap_or_else(|| anyhow::anyhow!("no DoH endpoint available")))
+}
+
+async fn read_cached_upstream(state: &AppState, key: &ResolveCacheKey) -> Option<ResolvedUpstream> {
+    let cache = state.resolve_cache.read().await;
+    cache.get(key).and_then(|entry| {
+        if Instant::now() < entry.expires_at {
+            Some(entry.upstream.clone())
+        } else {
+            None
+        }
+    })
+}
+
+async fn write_cached_upstream(state: &AppState, key: ResolveCacheKey, upstream: ResolvedUpstream) {
+    let mut cache = state.resolve_cache.write().await;
+    cache.retain(|_, entry| Instant::now() < entry.expires_at);
+    cache.insert(
+        key,
+        CachedResolvedUpstream {
+            upstream,
+            expires_at: Instant::now() + RESOLVE_CACHE_TTL,
+        },
+    );
 }
 
 async fn doh_query_once(
@@ -924,10 +984,7 @@ fn load_certificates(path: &std::path::Path) -> Result<Vec<CertificateDer<'stati
 }
 
 fn load_certificate_chain(bundle: &CertificateBundle) -> Result<Vec<CertificateDer<'static>>> {
-    let mut chain = load_certificates(&bundle.server_cert_path)?;
-    let mut issuer = load_certificates(&bundle.ca_cert_path)?;
-    chain.append(&mut issuer);
-    Ok(chain)
+    load_certificates(&bundle.server_cert_path)
 }
 
 fn load_private_key(path: &std::path::Path) -> Result<PrivateKeyDer<'static>> {

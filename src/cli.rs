@@ -36,6 +36,8 @@ pub enum Command {
     HelperStop,
     #[command(hide = true)]
     Daemon,
+    #[command(hide = true)]
+    TrayShell,
 }
 
 pub async fn run(cli: Cli) -> Result<()> {
@@ -88,6 +90,17 @@ pub async fn run(cli: Cli) -> Result<()> {
         }
         Some(Command::Daemon) => {
             service::run_foreground(cli.config, false).await?;
+        }
+        Some(Command::TrayShell) => {
+            #[cfg(target_os = "linux")]
+            {
+                let config_path = service::init_config(cli.config)?;
+                gui::run_tray_shell(config_path)?;
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                anyhow::bail!("tray-shell is only supported on Linux");
+            }
         }
     }
 

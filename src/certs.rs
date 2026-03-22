@@ -23,7 +23,7 @@ const CA_VALIDITY_DAYS: i64 = 365;
 const SERVER_VALIDITY_DAYS: i64 = 365;
 
 pub fn ensure_bundle(config: &AppConfig, root: &Path) -> Result<CertificateBundle> {
-    generate_bundle(config, root, true)
+    generate_bundle(config, root, false)
 }
 
 pub fn load_or_create_bundle(config: &AppConfig, root: &Path) -> Result<CertificateBundle> {

@@ -6,5 +6,5 @@ if (-not (Test-Path $cargo)) {
   throw "cargo.exe not found"
 }
 
-& $cargo build --release
+& $cargo build --release --bin linuxdo-accelerator
 Start-Process -FilePath ".\target\release\linuxdo-accelerator.exe" -ArgumentList "start" -Verb RunAs
