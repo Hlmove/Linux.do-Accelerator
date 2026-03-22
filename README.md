@@ -2,12 +2,21 @@
 
 一个原生 Rust 的 `linux.do` 专属加速器，同时提供：
 
+- 单一二进制：同一个 `linuxdo-accelerator` 同时支持 `CLI` 和桌面 `GUI`
 - `CLI`：适合脚本和终端操作
 - 桌面壳：双击启动 GUI，点击“加速/停止”，支持最小化
 - 一键生成并安装本地根证书
 - 一键写入 `hosts`
 - 本地监听 `80/443`
 - 将 `linux.do` / `www.linux.do` 反向代理回真实站点
+
+适合直接作为 GitHub 首页说明的摘要：
+
+- 原生 Rust 开发，不依赖 Node 运行时
+- Windows / Linux / macOS 三端统一交付
+- 单程序同时支持双击启动和命令行调用
+- 配置集中在一个 `linuxdo-accelerator.toml` 文件
+- 支持一键安装证书、接管域名、DoH 和本地监听
 
 ## 二进制结构
 
@@ -102,7 +111,24 @@ macOS 不再走本地交叉编译脚本，改为使用 GitHub Actions 工作流 
 
 ## 配置文件
 
-默认配置文件会写到系统用户配置目录下，内容类似：
+默认情况下，程序只使用一个主配置文件 `linuxdo-accelerator.toml`。三端默认位置如下：
+
+- Linux
+  - 配置文件：`~/.config/linuxdo-accelerator/linuxdo-accelerator.toml`
+  - 运行状态目录：`~/.local/share/linuxdo-accelerator/runtime`
+  - 证书目录：`~/.local/share/linuxdo-accelerator/certs`
+- Windows
+  - 配置文件：`%APPDATA%\linuxdo\linuxdo-accelerator\config\linuxdo-accelerator.toml`
+  - 运行状态目录：`%LOCALAPPDATA%\linuxdo\linuxdo-accelerator\data\runtime`
+  - 证书目录：`%LOCALAPPDATA%\linuxdo\linuxdo-accelerator\data\certs`
+- macOS
+  - 配置文件：`~/Library/Application Support/io.linuxdo.linuxdo-accelerator/linuxdo-accelerator.toml`
+  - 运行状态目录：`~/Library/Application Support/io.linuxdo.linuxdo-accelerator/runtime`
+  - 证书目录：`~/Library/Application Support/io.linuxdo.linuxdo-accelerator/certs`
+
+如果你启动时显式传了 `--config /path/to/linuxdo-accelerator.toml`，程序会改用你指定的那一份配置文件；对应的 `runtime` 和 `certs` 目录也会优先跟着这个配置目录走。
+
+配置文件内容类似：
 
 ```toml
 listen_host = "127.0.0.1"
