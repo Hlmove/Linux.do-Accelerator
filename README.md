@@ -104,7 +104,7 @@ Android 版目前走的是 DNS 代理接管方案：
 - Linux：Wayland / GNOME 下使用托盘代理恢复窗口
 - macOS：支持最小化到 Dock，已接入菜单栏图标恢复链路
 
-## Compliance Notice
+## 合规说明
 
 本项目定位为本地网络接管与调试工具，主要在用户自己的设备上完成以下操作：
 
