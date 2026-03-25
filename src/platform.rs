@@ -1,12 +1,15 @@
 #[cfg(target_os = "windows")]
 use std::ffi::OsString;
 use std::fs;
+#[cfg(target_os = "macos")]
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, anyhow, bail};
+#[cfg(target_os = "android")]
 use md5::compute as md5_compute;
+#[cfg(target_os = "android")]
 use x509_parser::prelude::{FromDer, X509Certificate};
 
 use crate::config::AppConfig;
@@ -47,6 +50,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 
 const LINUX_CA_FILE_NAME: &str = "linuxdo-accelerator-root-ca.crt";
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 enum MacosCaState {
     Missing,
     Matching,
@@ -235,19 +239,19 @@ pub fn is_process_running(pid: u32) -> bool {
     }
 }
 
-pub fn ensure_loopback_alias(config: &AppConfig) -> Result<()> {
+pub fn ensure_loopback_alias(_config: &AppConfig) -> Result<()> {
     #[cfg(target_os = "macos")]
     {
-        ensure_macos_loopback_aliases(config)?;
+        ensure_macos_loopback_aliases(_config)?;
     }
 
     Ok(())
 }
 
-pub fn remove_loopback_alias(config: &AppConfig) -> Result<()> {
+pub fn remove_loopback_alias(_config: &AppConfig) -> Result<()> {
     #[cfg(target_os = "macos")]
     {
-        remove_macos_loopback_aliases(config)?;
+        remove_macos_loopback_aliases(_config)?;
     }
 
     Ok(())
@@ -382,7 +386,9 @@ fn remove_macos_loopback_aliases(config: &AppConfig) -> Result<()> {
         let output = Command::new("ifconfig")
             .args(["lo0", "-alias", &addr])
             .output()
-            .with_context(|| format!("failed to execute ifconfig for loopback alias cleanup {addr}"))?;
+            .with_context(|| {
+                format!("failed to execute ifconfig for loopback alias cleanup {addr}")
+            })?;
         if output.status.success() {
             continue;
         }
@@ -926,6 +932,7 @@ fn android_fixup_ca_permissions(path: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "android")]
 fn android_cert_subject_hash_old(cert_pem: &[u8]) -> Result<String> {
     let mut reader = std::io::BufReader::new(cert_pem);
     let mut certs = rustls_pemfile::certs(&mut reader);
@@ -941,6 +948,7 @@ fn android_cert_subject_hash_old(cert_pem: &[u8]) -> Result<String> {
     Ok(format!("{value:08x}"))
 }
 
+#[cfg(target_os = "android")]
 fn android_cert_common_name(cert_pem: &[u8]) -> Result<String> {
     let mut reader = std::io::BufReader::new(cert_pem);
     let mut certs = rustls_pemfile::certs(&mut reader);
@@ -1343,6 +1351,7 @@ fn run_android_elevated(_executable: &Path, _args: &[String]) -> Result<()> {
     bail!("android elevation is unavailable on this platform")
 }
 
+#[cfg(target_os = "android")]
 fn shell_quote_arg(value: &str) -> String {
     if value.is_empty() {
         return "''".to_string();
@@ -1350,16 +1359,19 @@ fn shell_quote_arg(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
+#[cfg(target_os = "macos")]
 fn shell_join(executable: &Path, args: &[String]) -> String {
     let mut parts = vec![shell_quote(&executable.to_string_lossy())];
     parts.extend(args.iter().map(|arg| shell_quote(arg)));
     parts.join(" ")
 }
 
+#[cfg(target_os = "macos")]
 fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
+#[cfg(target_os = "macos")]
 fn applescript_escape(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
 }
@@ -1371,11 +1383,6 @@ fn should_fallback_to_macos_sudo(detail: &str) -> bool {
         || detail.contains("管理员用户名或密码不正确")
         || detail.contains("authorization failed")
         || detail.contains("授权失败")
-}
-
-#[cfg(not(target_os = "macos"))]
-fn should_fallback_to_macos_sudo(_detail: &str) -> bool {
-    false
 }
 
 #[cfg(target_os = "macos")]

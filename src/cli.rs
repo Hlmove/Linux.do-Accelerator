@@ -3,9 +3,9 @@ use std::path::PathBuf;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
+use crate::config::AppConfig;
 #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
 use crate::gui;
-use crate::config::AppConfig;
 use crate::service;
 
 #[derive(Debug, Parser)]
@@ -30,6 +30,8 @@ pub enum Command {
     Status,
     CleanHosts,
     ApplyHosts,
+    BackupHosts,
+    RestoreHosts,
     UninstallCert,
     Cleanup,
     #[command(hide = true)]
@@ -49,8 +51,8 @@ pub async fn run(cli: Cli) -> Result<()> {
         None | Some(Command::Gui) => {
             #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
             {
-            let config_path = service::init_config(cli.config.clone())?;
-            gui::run(config_path)?;
+                let config_path = service::init_config(cli.config.clone())?;
+                gui::run(config_path)?;
             }
             #[cfg(target_os = "android")]
             {
@@ -86,6 +88,14 @@ pub async fn run(cli: Cli) -> Result<()> {
         Some(Command::ApplyHosts) => {
             service::apply_hosts_only(cli.config)?;
             println!("hosts applied");
+        }
+        Some(Command::BackupHosts) => {
+            service::backup_hosts(cli.config)?;
+            println!("hosts backup ready");
+        }
+        Some(Command::RestoreHosts) => {
+            service::restore_hosts(cli.config)?;
+            println!("hosts restored");
         }
         Some(Command::UninstallCert) => {
             service::uninstall_certificate(cli.config)?;
