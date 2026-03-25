@@ -39,10 +39,13 @@ use crate::state::ServiceState;
 const APP_WINDOW_TITLE: &str = "Linux.do Accelerator";
 const APP_ID: &str = "linuxdo-accelerator";
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+const ACTIVE_REPAINT_INTERVAL: Duration = Duration::from_millis(100);
+const IDLE_REPAINT_INTERVAL: Duration = Duration::from_secs(2);
+const TRAY_REPAINT_INTERVAL: Duration = Duration::from_secs(5);
 
 pub fn run(config_path: PathBuf) -> Result<()> {
     let native_options = eframe::NativeOptions {
-        renderer: eframe::Renderer::Wgpu,
+        renderer: default_renderer(),
         viewport: egui::ViewportBuilder::default()
             .with_title(APP_WINDOW_TITLE)
             .with_app_id(APP_ID)
@@ -62,6 +65,14 @@ pub fn run(config_path: PathBuf) -> Result<()> {
         Box::new(move |cc| Ok(Box::new(AcceleratorApp::new(config_path.clone(), cc)))),
     )
     .map_err(|error| anyhow::anyhow!(error.to_string()))
+}
+
+fn default_renderer() -> eframe::Renderer {
+    if cfg!(target_os = "windows") {
+        eframe::Renderer::Glow
+    } else {
+        eframe::Renderer::Wgpu
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -1048,6 +1059,16 @@ impl AcceleratorApp {
         }
         self.last_minimized = minimized && !self.hidden_to_tray;
     }
+
+    fn repaint_interval(&self) -> Duration {
+        if self.busy || self.action_rx.is_some() || self.confirm_action.is_some() {
+            ACTIVE_REPAINT_INTERVAL
+        } else if self.hidden_to_tray {
+            TRAY_REPAINT_INTERVAL
+        } else {
+            IDLE_REPAINT_INTERVAL
+        }
+    }
 }
 
 impl eframe::App for AcceleratorApp {
@@ -1060,7 +1081,8 @@ impl eframe::App for AcceleratorApp {
 
         self.poll_action();
 
-        if self.last_refresh.elapsed() >= Duration::from_secs(1) {
+        let repaint_interval = self.repaint_interval();
+        if self.last_refresh.elapsed() >= repaint_interval {
             self.refresh_status();
             self.last_refresh = Instant::now();
         }
@@ -1193,7 +1215,7 @@ impl eframe::App for AcceleratorApp {
                 });
         }
 
-        ctx.request_repaint_after(Duration::from_millis(250));
+        ctx.request_repaint_after(repaint_interval);
     }
 }
 
