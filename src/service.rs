@@ -6,8 +6,10 @@ use anyhow::{Result, bail};
 
 use crate::certs::{ensure_bundle, load_or_create_bundle};
 use crate::config::AppConfig;
-use crate::hosts::{apply_hosts, backup_hosts_file, remove_hosts, restore_hosts_file};
-use crate::hosts_store::{BackupState, backup_state};
+use crate::hosts::{
+    apply_hosts, backup_hosts_file, remove_hosts, restore_hosts_file, validate_hosts_backup_file,
+};
+use crate::hosts_store::{BackupState, backup_state, clear_hosts_backup};
 use crate::paths::AppPaths;
 use crate::platform::{
     ensure_elevated, ensure_loopback_alias, install_ca, is_process_running, remove_loopback_alias,
@@ -376,19 +378,38 @@ fn terminate_running_service(paths: &AppPaths) -> Result<()> {
 
 fn cleanup_hosts_state(paths: &AppPaths) -> (String, Option<String>) {
     match backup_state(paths) {
-        BackupState::Ready => match restore_hosts_file(paths) {
-            Ok(()) => ("恢复原始 hosts".to_string(), None),
-            Err(error) => match remove_hosts(paths) {
-                Ok(()) => (
-                    "清理托管 hosts 规则（完整恢复失败）".to_string(),
-                    Some(format!(
-                        "failed to fully restore original hosts backup: {error:#}; cleanup fell back to removing the managed hosts block"
-                    )),
-                ),
+        BackupState::Ready => match validate_hosts_backup_file(paths) {
+            Ok(()) => match restore_hosts_file(paths) {
+                Ok(()) => ("恢复原始 hosts".to_string(), None),
+                Err(error) => match remove_hosts(paths) {
+                    Ok(()) => (
+                        "清理托管 hosts 规则（完整恢复失败）".to_string(),
+                        Some(format!(
+                            "failed to fully restore original hosts backup: {error:#}; cleanup fell back to removing the managed hosts block"
+                        )),
+                    ),
+                    Err(remove_error) => (
+                        "hosts 未清理".to_string(),
+                        Some(format!(
+                            "failed to fully restore original hosts backup: {error:#}; fallback removal also failed: {remove_error:#}"
+                        )),
+                    ),
+                },
+            },
+            Err(validation_error) => match remove_hosts(paths) {
+                Ok(()) => match clear_hosts_backup(paths) {
+                    Ok(()) => ("清理托管 hosts 规则并重置损坏的备份状态".to_string(), None),
+                    Err(clear_error) => (
+                        "清理托管 hosts 规则（备份损坏）".to_string(),
+                        Some(format!(
+                            "hosts backup is invalid: {validation_error:#}; managed hosts block was removed but clearing stale backup artifacts failed: {clear_error:#}"
+                        )),
+                    ),
+                },
                 Err(remove_error) => (
                     "hosts 未清理".to_string(),
                     Some(format!(
-                        "failed to fully restore original hosts backup: {error:#}; fallback removal also failed: {remove_error:#}"
+                        "hosts backup is invalid: {validation_error:#}; fallback removal failed: {remove_error:#}"
                     )),
                 ),
             },
@@ -401,14 +422,15 @@ fn cleanup_hosts_state(paths: &AppPaths) -> (String, Option<String>) {
             ),
         },
         BackupState::Inconsistent => match remove_hosts(paths) {
-            Ok(()) => (
-                "清理托管 hosts 规则（备份状态异常）".to_string(),
-                Some(format!(
-                    "hosts backup state is inconsistent; original hosts could not be fully restored (expected both {} and {})",
-                    paths.hosts_backup_path.display(),
-                    paths.hosts_backup_meta_path.display()
-                )),
-            ),
+            Ok(()) => match clear_hosts_backup(paths) {
+                Ok(()) => ("清理托管 hosts 规则并重置异常备份状态".to_string(), None),
+                Err(clear_error) => (
+                    "清理托管 hosts 规则（备份状态异常）".to_string(),
+                    Some(format!(
+                        "hosts backup state is inconsistent; managed hosts block was removed but clearing stale backup artifacts failed: {clear_error:#}"
+                    )),
+                ),
+            },
             Err(error) => (
                 "hosts 未清理".to_string(),
                 Some(format!(

@@ -4,7 +4,9 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 
 use crate::config::AppConfig;
-use crate::hosts_store::{ensure_hosts_backup, restore_hosts_from_backup, write_hosts_content};
+use crate::hosts_store::{
+    ensure_hosts_backup, restore_hosts_from_backup, validate_hosts_backup, write_hosts_content,
+};
 use crate::paths::AppPaths;
 
 const START_MARKER: &str = "# >>> linuxdo-accelerator >>>";
@@ -85,6 +87,19 @@ pub fn restore_hosts_file(paths: &AppPaths) -> Result<()> {
         // 完整恢复会覆盖当前 hosts，因此使用首次备份作为明确回滚点。
         restore_hosts_from_backup(paths, &path, &original)?;
         Ok(())
+    }
+}
+
+pub fn validate_hosts_backup_file(paths: &AppPaths) -> Result<()> {
+    #[cfg(target_os = "android")]
+    {
+        let _ = paths;
+        return Ok(());
+    }
+
+    #[cfg(not(target_os = "android"))]
+    {
+        validate_hosts_backup(paths, &hosts_path())
     }
 }
 

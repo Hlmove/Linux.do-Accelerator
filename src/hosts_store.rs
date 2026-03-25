@@ -45,7 +45,10 @@ pub(crate) enum BackupState {
 
 pub(crate) fn ensure_hosts_backup(paths: &AppPaths, source_path: &Path) -> Result<()> {
     match backup_state(paths) {
-        BackupState::Ready => return Ok(()),
+        BackupState::Ready => {
+            validate_hosts_backup(paths, source_path)?;
+            return Ok(());
+        }
         BackupState::Inconsistent => {
             bail!(
                 "hosts backup state is inconsistent; expected both {} and {}",
@@ -118,23 +121,7 @@ pub(crate) fn restore_hosts_from_backup(
     source_path: &Path,
     current_content: &str,
 ) -> Result<()> {
-    match backup_state(paths) {
-        BackupState::Ready => {}
-        BackupState::Missing => {
-            bail!(
-                "hosts backup is unavailable; expected both {} and {}",
-                paths.hosts_backup_path.display(),
-                paths.hosts_backup_meta_path.display()
-            );
-        }
-        BackupState::Inconsistent => {
-            bail!(
-                "hosts backup state is inconsistent; expected both {} and {}",
-                paths.hosts_backup_path.display(),
-                paths.hosts_backup_meta_path.display()
-            );
-        }
-    }
+    validate_hosts_backup(paths, source_path)?;
 
     let backup = fs::read_to_string(&paths.hosts_backup_path)
         .with_context(|| format!("failed to read {}", paths.hosts_backup_path.display()))?;
@@ -176,6 +163,61 @@ pub(crate) fn backup_state(paths: &AppPaths) -> BackupState {
         (false, false) => BackupState::Missing,
         (true, true) => BackupState::Ready,
         _ => BackupState::Inconsistent,
+    }
+}
+
+pub(crate) fn validate_hosts_backup(paths: &AppPaths, source_path: &Path) -> Result<()> {
+    match backup_state(paths) {
+        BackupState::Ready => {}
+        BackupState::Missing => {
+            bail!(
+                "hosts backup is unavailable; expected both {} and {}",
+                paths.hosts_backup_path.display(),
+                paths.hosts_backup_meta_path.display()
+            );
+        }
+        BackupState::Inconsistent => {
+            bail!(
+                "hosts backup state is inconsistent; expected both {} and {}",
+                paths.hosts_backup_path.display(),
+                paths.hosts_backup_meta_path.display()
+            );
+        }
+    }
+
+    let _ = fs::read_to_string(&paths.hosts_backup_path)
+        .with_context(|| format!("failed to read {}", paths.hosts_backup_path.display()))?;
+    let meta = load_backup_meta(paths)?;
+    if !source_path_matches(source_path, &meta.source_path) {
+        bail!(
+            "hosts backup source path mismatch; expected {}, got {}",
+            source_path.display(),
+            meta.source_path
+        );
+    }
+    Ok(())
+}
+
+pub(crate) fn clear_hosts_backup(paths: &AppPaths) -> Result<()> {
+    let backup_temp_path = temp_backup_path(&paths.hosts_backup_path);
+    let meta_temp_path = temp_backup_path(&paths.hosts_backup_meta_path);
+    let mut errors = Vec::new();
+
+    for path in [
+        &paths.hosts_backup_path,
+        &paths.hosts_backup_meta_path,
+        &backup_temp_path,
+        &meta_temp_path,
+    ] {
+        if let Err(error) = cleanup_temp_file(path) {
+            errors.push(format!("failed to remove {}: {error:#}", path.display()));
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        bail!(errors.join("; "));
     }
 }
 
@@ -451,7 +493,8 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::{
-        ensure_hosts_backup, load_backup_meta, restore_hosts_from_backup, write_hosts_content,
+        BackupState, backup_state, clear_hosts_backup, ensure_hosts_backup, load_backup_meta,
+        restore_hosts_from_backup, validate_hosts_backup, write_hosts_content,
     };
     use crate::paths::AppPaths;
 
@@ -544,6 +587,52 @@ mod tests {
                 .to_string()
                 .contains("hosts backup source path mismatch")
         );
+
+        cleanup_test_dir(&test_dir);
+    }
+
+    #[test]
+    fn validate_hosts_backup_rejects_broken_metadata() {
+        let test_dir = create_test_dir("validate_hosts_backup_rejects_broken_metadata");
+        let paths = test_paths(&test_dir);
+        std::fs::create_dir_all(&paths.runtime_dir).unwrap();
+        let source_path = test_dir.join("hosts");
+
+        std::fs::write(&source_path, "original").unwrap();
+        std::fs::write(&paths.hosts_backup_path, "backup").unwrap();
+        std::fs::write(&paths.hosts_backup_meta_path, "{not-json").unwrap();
+
+        let error = validate_hosts_backup(&paths, &source_path).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("failed to parse hosts backup metadata")
+        );
+
+        cleanup_test_dir(&test_dir);
+    }
+
+    #[test]
+    fn clear_hosts_backup_removes_partial_and_temp_files() {
+        let test_dir = create_test_dir("clear_hosts_backup_removes_partial_and_temp_files");
+        let paths = test_paths(&test_dir);
+        std::fs::create_dir_all(&paths.runtime_dir).unwrap();
+
+        std::fs::write(&paths.hosts_backup_path, "backup").unwrap();
+        let backup_temp_path = paths
+            .hosts_backup_path
+            .with_file_name("hosts.backup.linuxdo-accelerator.tmp");
+        let meta_temp_path = paths
+            .hosts_backup_meta_path
+            .with_file_name("hosts.backup.json.linuxdo-accelerator.tmp");
+        std::fs::write(&backup_temp_path, "temp").unwrap();
+        std::fs::write(&meta_temp_path, "temp").unwrap();
+
+        clear_hosts_backup(&paths).unwrap();
+
+        assert_eq!(backup_state(&paths), BackupState::Missing);
+        assert!(!backup_temp_path.exists());
+        assert!(!meta_temp_path.exists());
 
         cleanup_test_dir(&test_dir);
     }
