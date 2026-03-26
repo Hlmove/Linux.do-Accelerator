@@ -1302,7 +1302,7 @@ impl AcceleratorApp {
             let _ = tray.tray_icon.set_visible(true);
             self.hidden_to_tray = true;
             self.last_minimized = true;
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
             ctx.request_repaint();
         } else {
             self.feedback = "托盘不可用，已退回系统最小化".to_string();
@@ -1389,7 +1389,7 @@ impl AcceleratorApp {
         if let Some(tray) = &self.tray {
             let _ = tray.tray_icon.set_visible(false);
         }
-        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
         ctx.request_repaint();
     }
