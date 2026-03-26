@@ -21,8 +21,6 @@ use tray_icon::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 
 use crate::branding;
 use crate::config::AppConfig;
-use crate::hosts::validate_hosts_backup_file;
-use crate::hosts_store::{BackupState, backup_state};
 #[cfg(target_os = "windows")]
 use crate::paths::AppPaths;
 use crate::platform::run_elevated;
@@ -141,7 +139,6 @@ struct AcceleratorApp {
     config_path: PathBuf,
     config: AppConfig,
     status: ServiceState,
-    hosts_backup_state: BackupState,
     recent_logs: Vec<String>,
     feedback: String,
     busy: bool,
@@ -204,7 +201,6 @@ impl AcceleratorApp {
         let config = AppConfig::load_or_create(&config_path).unwrap_or_default();
         let config_modified_at = file_modified_at(&config_path);
         let status = service::status(Some(config_path.clone())).unwrap_or_default();
-        let hosts_backup_state = load_hosts_backup_state(&config_path);
         let recent_logs = load_recent_runtime_logs(&config_path);
         let runtime_log_modified_at = runtime_log_file_modified_at(&config_path);
         #[cfg(target_os = "windows")]
@@ -230,7 +226,6 @@ impl AcceleratorApp {
             config_path,
             config,
             status,
-            hosts_backup_state,
             recent_logs,
             feedback: String::new(),
             busy: false,
@@ -269,7 +264,6 @@ impl AcceleratorApp {
         if let Ok(status) = service::status(Some(self.config_path.clone())) {
             self.status = self.apply_optimistic_state(status);
         }
-        self.hosts_backup_state = load_hosts_backup_state(&self.config_path);
         let current_log_modified_at = runtime_log_file_modified_at(&self.config_path);
         if current_log_modified_at != self.runtime_log_modified_at {
             self.recent_logs = load_recent_runtime_logs(&self.config_path);
@@ -347,10 +341,6 @@ impl AcceleratorApp {
                                     self.status.last_error = None;
                                     self.optimistic_running = Some((false, deadline));
                                 }
-                                Some(GuiAction::RestoreHosts) | Some(GuiAction::Cleanup) => {
-                                    self.optimistic_running = None;
-                                    self.refresh_status();
-                                }
                                 None => {}
                             }
                         }
@@ -412,106 +402,6 @@ impl AcceleratorApp {
             vec!["暂无运行日志。执行开始、停止、恢复等操作后会在这里显示。".to_string()]
         } else {
             self.recent_logs.clone()
-        }
-    }
-
-    fn hosts_backup_badge(&self) -> (&'static str, egui::Color32) {
-        match self.hosts_backup_state {
-            BackupState::Ready => ("已检测到备份", egui::Color32::from_rgb(106, 220, 155)),
-            BackupState::Missing => ("未检测到备份", egui::Color32::from_rgb(250, 196, 92)),
-            BackupState::Inconsistent => ("备份状态异常", egui::Color32::from_rgb(255, 120, 100)),
-        }
-    }
-
-    fn maintenance_hint(&self) -> &'static str {
-        if self.status.running {
-            return "停止加速时会自动恢复 hosts；彻底恢复会自动停止并清理。";
-        }
-
-        match self.hosts_backup_state {
-            BackupState::Ready => "恢复 hosts 只恢复 hosts；彻底恢复还会卸载证书并清理状态。",
-            BackupState::Missing => {
-                "未发现 hosts 备份；仍可用“彻底恢复原始状态”清理程序写入的规则。"
-            }
-            BackupState::Inconsistent => {
-                "hosts 备份状态异常；建议直接用“彻底恢复原始状态”尽量回到初始状态。"
-            }
-        }
-    }
-
-    fn can_restore_hosts(&self) -> bool {
-        !self.busy && self.hosts_backup_state == BackupState::Ready
-    }
-
-    fn confirm_summary(&self, action: GuiAction) -> String {
-        match action {
-            GuiAction::RestoreHosts => {
-                "会用首次接管前的备份覆盖当前 hosts 文件；如果加速正在运行，会先自动停止。"
-                    .to_string()
-            }
-            GuiAction::Cleanup => {
-                "会停止加速，并尽量把本程序对系统做的改动恢复到初始状态。".to_string()
-            }
-            GuiAction::Start | GuiAction::Stop => "确认执行该操作。".to_string(),
-        }
-    }
-
-    fn confirm_details(&self, action: GuiAction) -> Vec<String> {
-        match action {
-            GuiAction::RestoreHosts => vec![
-                "仅恢复 hosts 文件，不会卸载根证书。".to_string(),
-                "如果当前加速正在运行，会先自动停止加速服务。".to_string(),
-                "恢复后会尝试刷新系统 DNS 缓存。".to_string(),
-                "恢复完成后，如需再次加速，可重新点击“开始加速”。".to_string(),
-            ],
-            GuiAction::Cleanup => {
-                let mut lines = vec![
-                    "会停止当前加速服务。".to_string(),
-                    "会移除回环别名并清理运行状态。".to_string(),
-                    "会卸载根证书；后续如需继续使用，需要重新安装。".to_string(),
-                ];
-                match self.hosts_backup_state {
-                    BackupState::Ready => lines.insert(
-                        1,
-                        "当前已检测到完整 hosts 备份，会优先恢复首次接管前的原始内容。"
-                            .to_string(),
-                    ),
-                    BackupState::Missing => lines.insert(
-                        1,
-                        "当前未检测到完整 hosts 备份，无法保证完整恢复原始 hosts；会退化为仅清理本程序写入的规则。"
-                            .to_string(),
-                    ),
-                    BackupState::Inconsistent => lines.insert(
-                        1,
-                        "当前 hosts 备份状态异常，无法直接做完整恢复；会退化为仅清理本程序写入的规则。"
-                            .to_string(),
-                    ),
-                }
-                lines
-            }
-            GuiAction::Start | GuiAction::Stop => Vec::new(),
-        }
-    }
-
-    fn confirm_status_note(&self, action: GuiAction) -> Option<(String, egui::Color32)> {
-        match action {
-            GuiAction::Cleanup => {
-                let (label, color) = self.hosts_backup_badge();
-                Some((format!("当前检测结果：{label}"), color))
-            }
-            GuiAction::RestoreHosts => Some((
-                if self.status.running {
-                    "当前状态：加速中，确认后会先自动停止，再恢复 hosts。".to_string()
-                } else {
-                    "当前状态：已停止，可直接恢复 hosts。".to_string()
-                },
-                if self.status.running {
-                    egui::Color32::from_rgb(250, 196, 92)
-                } else {
-                    egui::Color32::from_rgb(106, 220, 155)
-                },
-            )),
-            GuiAction::Start | GuiAction::Stop => None,
         }
     }
 
@@ -638,78 +528,6 @@ impl AcceleratorApp {
                     self.show_about = true;
                 }
             });
-        });
-    }
-
-    fn render_maintenance_panel(&mut self, ui: &mut egui::Ui) {
-        panel_frame(
-            egui::Color32::from_rgb(38, 29, 22),
-            egui::Color32::from_rgb(86, 63, 49),
-        )
-        .show(ui, |ui| {
-            let (backup_label, backup_color) = self.hosts_backup_badge();
-            ui.horizontal_wrapped(|ui| {
-                ui.label(
-                    RichText::new("恢复与清理")
-                        .font(FontId::proportional(12.5))
-                        .strong()
-                        .color(egui::Color32::from_rgb(255, 200, 128)),
-                );
-                egui::Frame::new()
-                    .fill(backup_color.linear_multiply(0.14))
-                    .stroke(egui::Stroke::new(1.0, backup_color.linear_multiply(0.7)))
-                    .inner_margin(egui::Margin::symmetric(8, 4))
-                    .corner_radius(egui::CornerRadius::same(255))
-                    .show(ui, |ui| {
-                        ui.label(
-                            RichText::new(backup_label)
-                                .font(FontId::proportional(10.5))
-                                .strong()
-                                .color(backup_color),
-                        );
-                    });
-            });
-            ui.add_space(4.0);
-            ui.label(
-                RichText::new(self.maintenance_hint())
-                    .font(FontId::proportional(11.8))
-                    .color(egui::Color32::from_rgb(229, 231, 233)),
-            );
-            ui.add_space(4.0);
-            ui.label(
-                RichText::new("这些操作会再次弹出管理员确认。")
-                    .font(FontId::proportional(10.8))
-                    .color(egui::Color32::from_rgb(177, 184, 190)),
-            );
-            ui.add_space(10.0);
-
-            if ui
-                .add(filled_button(
-                    "恢复 hosts",
-                    egui::Color32::from_rgb(46, 102, 86),
-                    egui::Color32::from_rgb(245, 249, 247),
-                    egui::Color32::from_rgb(68, 136, 116),
-                    egui::vec2(ui.available_width(), 38.0),
-                    self.can_restore_hosts(),
-                ))
-                .clicked()
-            {
-                self.confirm_action = Some(GuiAction::RestoreHosts);
-            }
-
-            if ui
-                .add(filled_button(
-                    "彻底恢复原始状态",
-                    egui::Color32::from_rgb(136, 63, 56),
-                    egui::Color32::from_rgb(252, 247, 245),
-                    egui::Color32::from_rgb(176, 86, 77),
-                    egui::vec2(ui.available_width(), 38.0),
-                    !self.busy,
-                ))
-                .clicked()
-            {
-                self.confirm_action = Some(GuiAction::Cleanup);
-            }
         });
     }
 
@@ -869,36 +687,23 @@ impl AcceleratorApp {
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         ui.label(
-                            RichText::new(self.confirm_summary(action))
+                            RichText::new("该操作会再次申请管理员权限。")
                                 .font(FontId::proportional(13.0))
                                 .strong(),
                         );
-
-                        if let Some((note, color)) = self.confirm_status_note(action) {
-                            ui.add_space(2.0);
-                            egui::Frame::new()
-                                .fill(color.linear_multiply(0.12))
-                                .stroke(egui::Stroke::new(1.0, color.linear_multiply(0.72)))
-                                .inner_margin(egui::Margin::symmetric(10, 8))
-                                .corner_radius(egui::CornerRadius::same(10))
-                                .show(ui, |ui| {
-                                    ui.label(
-                                        RichText::new(note)
-                                            .font(FontId::proportional(11.2))
-                                            .strong()
-                                            .color(color),
-                                    );
-                                });
-                        }
-
                         ui.add_space(2.0);
-                        for line in self.confirm_details(action) {
-                            ui.label(
-                                RichText::new(format!("• {line}"))
-                                    .font(FontId::proportional(11.5))
-                                    .color(egui::Color32::from_rgb(213, 218, 222)),
-                            );
-                        }
+                        ui.label(
+                            RichText::new("• 开始加速：准备环境并启动本地代理。")
+                                .font(FontId::proportional(11.5))
+                                .color(egui::Color32::from_rgb(213, 218, 222)),
+                        );
+                        ui.label(
+                            RichText::new(
+                                "• 停止加速：自动停止服务、恢复 hosts，并尝试刷新 DNS 缓存。",
+                            )
+                            .font(FontId::proportional(11.5))
+                            .color(egui::Color32::from_rgb(213, 218, 222)),
+                        );
 
                         ui.add_space(2.0);
                         ui.label(
@@ -1228,8 +1033,6 @@ impl eframe::App for AcceleratorApp {
 enum GuiAction {
     Start,
     Stop,
-    RestoreHosts,
-    Cleanup,
 }
 
 impl GuiAction {
@@ -1237,8 +1040,6 @@ impl GuiAction {
         match self {
             Self::Start => "正在申请权限并启动加速...",
             Self::Stop => "正在停止加速并恢复 hosts...",
-            Self::RestoreHosts => "正在恢复 hosts 备份...",
-            Self::Cleanup => "正在恢复原始状态...",
         }
     }
 
@@ -1246,42 +1047,21 @@ impl GuiAction {
         match self {
             Self::Start => "helper-start",
             Self::Stop => "helper-stop",
-            Self::RestoreHosts => "restore-hosts",
-            Self::Cleanup => "cleanup",
         }
     }
 
     fn confirm_title(self) -> &'static str {
-        match self {
-            Self::RestoreHosts => "确认恢复 hosts",
-            Self::Cleanup => "确认彻底恢复原始状态",
-            Self::Start | Self::Stop => "确认操作",
-        }
+        "确认操作"
     }
 
     fn confirm_button(self) -> &'static str {
-        match self {
-            Self::RestoreHosts => "确认恢复 hosts",
-            Self::Cleanup => "确认恢复原始状态",
-            Self::Start | Self::Stop => "确认",
-        }
-    }
-
-    fn fallback_success_message(self) -> &'static str {
-        match self {
-            Self::Start => "加速已启动，可以直接最小化窗口",
-            Self::Stop => "加速已停止，hosts 已恢复",
-            Self::RestoreHosts => "hosts 已恢复为备份",
-            Self::Cleanup => "已恢复原始状态",
-        }
+        "确认"
     }
 
     fn error_context(self) -> &'static str {
         match self {
             Self::Start => "elevation or command execution failed",
             Self::Stop => "failed to stop acceleration from GUI",
-            Self::RestoreHosts => "failed to restore hosts from GUI",
-            Self::Cleanup => "failed to cleanup accelerator state from GUI",
         }
     }
 }
@@ -1355,15 +1135,6 @@ fn execute_action(config_path: &Path, action: GuiAction) -> Result<String> {
             GuiAction::Stop if !status.running => {
                 return Ok(status.status_text);
             }
-            GuiAction::RestoreHosts | GuiAction::Cleanup => {
-                if let Some(error) = status.last_error.clone() {
-                    bail!(error);
-                }
-                if service_state_changed(&before_status, &status) {
-                    return Ok(status.status_text);
-                }
-                return Ok(action.fallback_success_message().to_string());
-            }
             _ => {
                 if let Some(error) = status.last_error.clone() {
                     bail!(error);
@@ -1386,21 +1157,6 @@ fn service_state_changed(before: &ServiceState, after: &ServiceState) -> bool {
         || before.status_text != after.status_text
         || before.last_error != after.last_error
         || before.updated_at != after.updated_at
-}
-
-fn load_hosts_backup_state(config_path: &Path) -> BackupState {
-    service::resolve_paths(Some(config_path.to_path_buf()))
-        .map(|paths| match backup_state(&paths) {
-            BackupState::Ready => {
-                if validate_hosts_backup_file(&paths).is_ok() {
-                    BackupState::Ready
-                } else {
-                    BackupState::Inconsistent
-                }
-            }
-            state => state,
-        })
-        .unwrap_or(BackupState::Missing)
 }
 
 fn load_recent_runtime_logs(config_path: &Path) -> Vec<String> {
