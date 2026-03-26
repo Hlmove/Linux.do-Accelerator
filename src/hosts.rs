@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs;
 use std::path::PathBuf;
 
@@ -111,7 +112,14 @@ pub fn validate_hosts_backup_file(paths: &AppPaths) -> Result<()> {
 #[cfg(not(target_os = "android"))]
 fn render_managed_hosts(original: &str, config: &AppConfig) -> String {
     let newline = detect_newline(original);
-    let mut content = strip_managed_block(original);
+    let managed_hosts = config
+        .hosts_domains()
+        .iter()
+        .filter(|host| !host.starts_with("*."))
+        .map(|host| host.to_ascii_lowercase())
+        .collect::<HashSet<_>>();
+    let mut content =
+        strip_conflicting_host_entries(&strip_managed_block(original), &managed_hosts);
 
     if !content.is_empty() && !content.ends_with(newline) {
         content.push_str(newline);
@@ -129,6 +137,57 @@ fn render_managed_hosts(original: &str, config: &AppConfig) -> String {
     content.push_str(END_MARKER);
     content.push_str(newline);
     content
+}
+
+#[cfg(not(target_os = "android"))]
+fn strip_conflicting_host_entries(content: &str, managed_hosts: &HashSet<String>) -> String {
+    if managed_hosts.is_empty() {
+        return content.to_string();
+    }
+
+    let newline = detect_newline(content);
+    let mut output = Vec::new();
+
+    for raw_line in content.lines() {
+        let trimmed = raw_line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            output.push(raw_line.to_string());
+            continue;
+        }
+
+        let (line_body, comment) = match raw_line.find('#') {
+            Some(index) => (&raw_line[..index], Some(&raw_line[index..])),
+            None => (raw_line, None),
+        };
+
+        let fields = line_body.split_whitespace().collect::<Vec<_>>();
+        if fields.len() < 2 {
+            output.push(raw_line.to_string());
+            continue;
+        }
+
+        let address = fields[0];
+        let remaining_hosts = fields[1..]
+            .iter()
+            .copied()
+            .filter(|host| !managed_hosts.contains(&host.to_ascii_lowercase()))
+            .collect::<Vec<_>>();
+
+        if remaining_hosts.is_empty() {
+            continue;
+        }
+
+        let mut rebuilt = format!("{address} {}", remaining_hosts.join(" "));
+        if let Some(comment) = comment {
+            if !comment.trim().is_empty() {
+                rebuilt.push(' ');
+                rebuilt.push_str(comment.trim_start());
+            }
+        }
+        output.push(rebuilt);
+    }
+
+    output.join(newline)
 }
 
 #[cfg(not(target_os = "android"))]
@@ -245,8 +304,12 @@ fn hosts_path() -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{backup_baseline_content, render_managed_hosts, strip_managed_block};
+    use super::{
+        backup_baseline_content, render_managed_hosts, strip_conflicting_host_entries,
+        strip_managed_block,
+    };
     use crate::config::AppConfig;
+    use std::collections::HashSet;
 
     #[test]
     fn strip_managed_block_only_removes_owned_lines() {
@@ -317,5 +380,26 @@ mod tests {
 
         let backup = backup_baseline_content(&content);
         assert_eq!(backup, "127.0.0.1 localhost\n1.1.1.1 example.com");
+    }
+
+    #[test]
+    fn strip_conflicting_host_entries_removes_older_duplicate_host_mappings() {
+        let content = [
+            "127.0.0.1 localhost",
+            "172.66.166.61 linux.do",
+            "8.8.8.8 example.com www.linux.do # keep example only",
+            "1.1.1.1 untouched.example",
+        ]
+        .join("\n");
+        let managed_hosts = ["linux.do", "www.linux.do"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<HashSet<_>>();
+
+        let stripped = strip_conflicting_host_entries(&content, &managed_hosts);
+
+        assert!(!stripped.contains("172.66.166.61 linux.do"));
+        assert!(stripped.contains("8.8.8.8 example.com # keep example only"));
+        assert!(stripped.contains("1.1.1.1 untouched.example"));
     }
 }

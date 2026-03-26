@@ -41,6 +41,7 @@ pub fn setup(config_path: Option<PathBuf>) -> Result<()> {
         let bundle = ensure_bundle(&config, &paths.cert_dir)?;
         install_ca(&bundle.ca_cert_path, &config.ca_common_name)?;
         apply_hosts(&config, &paths)?;
+        let _ = flush_dns_cache();
         state::mark_stopped(&paths, "系统加速环境已准备")?;
         Ok(())
     })();
@@ -89,6 +90,7 @@ pub async fn run_foreground(config_path: Option<PathBuf>, with_setup: bool) -> R
     if with_setup {
         install_ca(&bundle.ca_cert_path, &config.ca_common_name)?;
         apply_hosts(&config, &paths)?;
+        let _ = flush_dns_cache();
     }
 
     let pid = std::process::id();
@@ -129,6 +131,7 @@ pub fn helper_start(config_path: Option<PathBuf>) -> Result<()> {
         #[cfg(target_os = "macos")]
         let _ = bundle;
         apply_hosts(&config, &paths)?;
+        let _ = flush_dns_cache();
         state::mark_starting(&paths)?;
 
         let cli_binary = current_cli_binary()?;
@@ -285,6 +288,7 @@ pub fn apply_hosts_only(config_path: Option<PathBuf>) -> Result<()> {
         ensure_elevated(&config, true)?;
         ensure_loopback_alias(&config)?;
         apply_hosts(&config, &paths)?;
+        let _ = flush_dns_cache();
         Ok(())
     })();
     match &result {
