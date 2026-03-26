@@ -1404,17 +1404,12 @@ fn load_system_ui_font() -> Option<(String, Vec<u8>)> {
 
 #[cfg(target_os = "windows")]
 fn preferred_system_font_families() -> &'static [&'static str] {
-    &[
-        "Microsoft YaHei UI",
-        "Microsoft YaHei",
-        "SimHei",
-        "Segoe UI",
-    ]
+    &["Microsoft YaHei UI", "Microsoft YaHei", "SimHei"]
 }
 
 #[cfg(target_os = "macos")]
 fn preferred_system_font_families() -> &'static [&'static str] {
-    &["PingFang SC", "Hiragino Sans GB", "Helvetica Neue"]
+    &["PingFang SC", "Hiragino Sans GB"]
 }
 
 #[cfg(target_os = "linux")]
@@ -1425,7 +1420,6 @@ fn preferred_system_font_families() -> &'static [&'static str] {
         "WenQuanYi Micro Hei",
         "Source Han Sans SC",
         "Droid Sans Fallback",
-        "Noto Sans",
     ]
 }
 
