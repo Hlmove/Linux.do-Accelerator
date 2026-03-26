@@ -38,6 +38,8 @@ const ACTIVE_REPAINT_INTERVAL: Duration = Duration::from_millis(100);
 const IDLE_REPAINT_INTERVAL: Duration = Duration::from_secs(5);
 const TRAY_REPAINT_INTERVAL: Duration = Duration::from_secs(15);
 const EMBEDDED_CJK_FONT: &[u8] = include_bytes!("../assets/fonts/DroidSansFallbackFull.ttf");
+const LAUNCHER_WINDOW_SIZE: [f32; 2] = [470.0, 170.0];
+const DETAILS_WINDOW_SIZE: [f32; 2] = [960.0, 720.0];
 
 pub fn run(config_path: PathBuf) -> Result<()> {
     let native_options = eframe::NativeOptions {
@@ -46,9 +48,9 @@ pub fn run(config_path: PathBuf) -> Result<()> {
             .with_title(APP_WINDOW_TITLE)
             .with_app_id(APP_ID)
             .with_icon(branding::icon_data(256))
-            .with_inner_size([470.0, 170.0])
-            .with_min_inner_size([470.0, 170.0])
-            .with_max_inner_size([470.0, 170.0])
+            .with_inner_size(LAUNCHER_WINDOW_SIZE)
+            .with_min_inner_size(LAUNCHER_WINDOW_SIZE)
+            .with_max_inner_size(LAUNCHER_WINDOW_SIZE)
             .with_minimize_button(!cfg!(target_os = "linux"))
             .with_maximize_button(false)
             .with_resizable(false),
@@ -269,9 +271,7 @@ struct AcceleratorApp {
     last_refresh: Instant,
     config_modified_at: Option<SystemTime>,
     runtime_log_modified_at: Option<SystemTime>,
-    show_details: bool,
-    show_about: bool,
-    show_config: bool,
+    current_page: UiPage,
     logo: egui::TextureHandle,
     #[cfg(target_os = "linux")]
     tray: Option<TrayState>,
@@ -289,6 +289,14 @@ struct AcceleratorApp {
     hidden_to_tray: bool,
     #[cfg(target_os = "windows")]
     last_minimized: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UiPage {
+    Launcher,
+    Details,
+    Config,
+    About,
 }
 
 #[cfg(target_os = "linux")]
@@ -347,9 +355,7 @@ impl AcceleratorApp {
             last_refresh: Instant::now() - Duration::from_secs(2),
             config_modified_at,
             runtime_log_modified_at,
-            show_details: false,
-            show_about: false,
-            show_config: false,
+            current_page: UiPage::Launcher,
             logo,
             #[cfg(target_os = "linux")]
             tray,
@@ -559,7 +565,7 @@ impl AcceleratorApp {
         });
     }
 
-    fn render_action_panel(&mut self, ui: &mut egui::Ui, _ctx: &egui::Context) {
+    fn render_action_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         panel_frame(
             egui::Color32::from_rgb(24, 29, 35),
             egui::Color32::from_rgb(53, 61, 69),
@@ -608,19 +614,19 @@ impl AcceleratorApp {
                         .add(subtle_button("详情", egui::vec2(72.0, 38.0), true))
                         .clicked()
                     {
-                        self.show_details = true;
+                        self.navigate_to(ctx, UiPage::Details);
                     }
                     if ui
                         .add(subtle_button("设置", egui::vec2(72.0, 38.0), true))
                         .clicked()
                     {
-                        self.show_config = true;
+                        self.navigate_to(ctx, UiPage::Config);
                     }
                     if ui
                         .add(subtle_button("关于", egui::vec2(72.0, 38.0), true))
                         .clicked()
                     {
-                        self.show_about = true;
+                        self.navigate_to(ctx, UiPage::About);
                     }
                 });
 
@@ -669,6 +675,52 @@ impl AcceleratorApp {
             self.render_scope_panel(ui);
             self.render_tips_panel(ui);
         }
+    }
+
+    fn render_page_header(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, title: &str) {
+        ui.horizontal(|ui| {
+            if ui
+                .add(subtle_button("返回", egui::vec2(76.0, 34.0), true))
+                .clicked()
+            {
+                self.navigate_to(ctx, UiPage::Launcher);
+            }
+            ui.add_space(8.0);
+            ui.label(
+                RichText::new(title)
+                    .font(FontId::proportional(20.0))
+                    .strong()
+                    .color(egui::Color32::from_rgb(232, 236, 239)),
+            );
+        });
+        ui.add_space(12.0);
+        ui.separator();
+        ui.add_space(12.0);
+    }
+
+    fn navigate_to(&mut self, ctx: &egui::Context, page: UiPage) {
+        self.current_page = page;
+        match page {
+            UiPage::Launcher => {
+                let size = egui::vec2(LAUNCHER_WINDOW_SIZE[0], LAUNCHER_WINDOW_SIZE[1]);
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+                ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(size));
+                ctx.send_viewport_cmd(egui::ViewportCommand::MaxInnerSize(size));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Resizable(false));
+            }
+            UiPage::Details | UiPage::Config | UiPage::About => {
+                let size = egui::vec2(DETAILS_WINDOW_SIZE[0], DETAILS_WINDOW_SIZE[1]);
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+                ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(egui::vec2(
+                    760.0, 560.0,
+                )));
+                ctx.send_viewport_cmd(egui::ViewportCommand::MaxInnerSize(egui::vec2(
+                    1440.0, 1080.0,
+                )));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Resizable(true));
+            }
+        }
+        ctx.request_repaint();
     }
 
     fn render_status_panel(&self, ui: &mut egui::Ui) {
@@ -1009,130 +1061,101 @@ impl eframe::App for AcceleratorApp {
             self.last_refresh = Instant::now();
         }
 
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.add_space(8.0);
-            egui::Frame::new()
-                .fill(egui::Color32::from_rgb(15, 19, 24))
-                .inner_margin(egui::Margin::same(14))
-                .corner_radius(egui::CornerRadius::same(18))
-                .show(ui, |ui| {
-                    self.render_action_panel(ui, ctx);
-                });
-        });
+        egui::CentralPanel::default()
+            .frame(egui::Frame::new().fill(egui::Color32::from_rgb(12, 16, 20)))
+            .show(ctx, |ui| {
+            ui.spacing_mut().item_spacing = egui::vec2(10.0, 10.0);
 
-        self.show_confirm_action_dialog(ctx);
-
-        if self.show_details {
-            egui::Window::new("状态详情")
-                .collapsible(false)
-                .resizable(true)
-                .default_width(880.0)
-                .default_height(620.0)
-                .show(ctx, |ui| {
+            match self.current_page {
+                UiPage::Launcher => {
+                    ui.add_space(8.0);
+                    egui::Frame::new()
+                        .fill(egui::Color32::from_rgb(15, 19, 24))
+                        .inner_margin(egui::Margin::same(14))
+                        .corner_radius(egui::CornerRadius::same(18))
+                        .show(ui, |ui| {
+                            self.render_action_panel(ui, ctx);
+                        });
+                }
+                UiPage::Details => {
                     egui::ScrollArea::vertical()
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
+                            self.render_page_header(ui, ctx, "状态详情");
                             self.render_details_content(ui);
-                            ui.add_space(10.0);
-                            if ui
-                                .add(subtle_button("关闭", egui::vec2(92.0, 34.0), true))
-                                .clicked()
-                            {
-                                self.show_details = false;
-                            }
                         });
-                });
-        }
+                }
+                UiPage::Config => {
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            self.render_page_header(ui, ctx, "设置");
+                            ui.label(
+                                RichText::new("配置总览")
+                                    .font(FontId::proportional(16.0))
+                                    .strong(),
+                            );
+                            ui.label("当前使用单配置文件，修改后重新启动加速即可生效。");
+                            ui.separator();
+                            compact_row(ui, "主配置", &self.config_path.display().to_string());
+                            compact_row(ui, "上游", &self.config.upstream);
+                            compact_row(
+                                ui,
+                                "DoH",
+                                &self
+                                    .config
+                                    .doh_endpoints
+                                    .first()
+                                    .cloned()
+                                    .unwrap_or_else(|| "未配置".to_string()),
+                            );
+                            ui.add_space(6.0);
+                            ui.horizontal_wrapped(|ui| {
+                                compact_metric(
+                                    ui,
+                                    "接管域名",
+                                    &self.config.proxy_domains.len().to_string(),
+                                );
+                                compact_metric(
+                                    ui,
+                                    "DoH 数量",
+                                    &self.config.doh_endpoints.len().to_string(),
+                                );
+                                compact_metric(
+                                    ui,
+                                    "证书 SAN",
+                                    &self.config.certificate_domains.len().to_string(),
+                                );
+                            });
+                        });
+                }
+                UiPage::About => {
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            self.render_page_header(ui, ctx, "关于");
+                            ui.add(egui::Image::new((self.logo.id(), egui::vec2(46.0, 46.0))));
+                            ui.label(
+                                RichText::new("Linux.do Accelerator")
+                                    .font(FontId::proportional(18.0))
+                                    .strong(),
+                            );
+                            ui.label(format!("版本 v{APP_VERSION}"));
+                            ui.label("原生 Rust 桌面壳 + CLI");
+                            ui.label(
+                                "支持证书安装、hosts 接管、本地 80/443 监听和 Android VPN DNS 接管。",
+                            );
+                            ui.label("DoH 与子域支持列表统一放在 linuxdo-accelerator.toml。");
+                            ui.label("点击加速会触发管理员提权，后台启动守护进程。");
+                            ui.label(
+                                "如果系统拒绝提权、DoH 不可用或端口监听失败，界面会直接显示真实错误。",
+                            );
+                        });
+                }
+            }
+        });
 
-        if self.show_config {
-            egui::Window::new("设置")
-                .collapsible(false)
-                .resizable(true)
-                .default_width(700.0)
-                .default_height(360.0)
-                .show(ctx, |ui| {
-                    ui.spacing_mut().item_spacing = egui::vec2(10.0, 10.0);
-                    ui.label(
-                        RichText::new("配置总览")
-                            .font(FontId::proportional(16.0))
-                            .strong(),
-                    );
-                    ui.label("当前使用单配置文件，修改后重新启动加速即可生效。");
-                    ui.separator();
-                    compact_row(ui, "主配置", &self.config_path.display().to_string());
-                    compact_row(ui, "上游", &self.config.upstream);
-                    compact_row(
-                        ui,
-                        "DoH",
-                        &self
-                            .config
-                            .doh_endpoints
-                            .first()
-                            .cloned()
-                            .unwrap_or_else(|| "未配置".to_string()),
-                    );
-                    ui.add_space(6.0);
-                    ui.horizontal_wrapped(|ui| {
-                        compact_metric(
-                            ui,
-                            "接管域名",
-                            &self.config.proxy_domains.len().to_string(),
-                        );
-                        compact_metric(
-                            ui,
-                            "DoH 数量",
-                            &self.config.doh_endpoints.len().to_string(),
-                        );
-                        compact_metric(
-                            ui,
-                            "证书 SAN",
-                            &self.config.certificate_domains.len().to_string(),
-                        );
-                    });
-                    ui.add_space(10.0);
-                    if ui
-                        .add(subtle_button("关闭", egui::vec2(92.0, 34.0), true))
-                        .clicked()
-                    {
-                        self.show_config = false;
-                    }
-                });
-        }
-
-        if self.show_about {
-            egui::Window::new("关于")
-                .collapsible(false)
-                .resizable(true)
-                .default_width(620.0)
-                .default_height(360.0)
-                .show(ctx, |ui| {
-                    ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
-                    egui::ScrollArea::vertical().show(ui, |ui| {
-                        ui.add(egui::Image::new((self.logo.id(), egui::vec2(46.0, 46.0))));
-                        ui.label(
-                            RichText::new("Linux.do Accelerator")
-                                .font(FontId::proportional(18.0))
-                                .strong(),
-                        );
-                        ui.label(format!("版本 v{APP_VERSION}"));
-                        ui.label("原生 Rust 桌面壳 + CLI");
-                        ui.label(
-                            "支持证书安装、hosts 接管、本地 80/443 监听和 Android VPN DNS 接管。",
-                        );
-                        ui.label("DoH 与子域支持列表统一放在 linuxdo-accelerator.toml。");
-                        ui.label("点击加速会触发管理员提权，后台启动守护进程。");
-                        ui.label(
-                            "如果系统拒绝提权、DoH 不可用或端口监听失败，界面会直接显示真实错误。",
-                        );
-                    });
-                    if ui
-                        .add(subtle_button("关闭", egui::vec2(92.0, 34.0), true))
-                        .clicked()
-                    {
-                        self.show_about = false;
-                    }
-                });
-        }
+        self.show_confirm_action_dialog(ctx);
 
         ctx.request_repaint_after(repaint_interval);
     }
