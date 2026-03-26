@@ -569,44 +569,54 @@ impl AcceleratorApp {
         );
     }
 
-    fn render_header(&self, ui: &mut egui::Ui) {
+    fn render_brand_banner(&self, ui: &mut egui::Ui, title: &str, summary: &str) {
         let (headline, accent) = self.headline_status();
-        ui.horizontal(|ui| {
-            ui.add(egui::Image::new((self.logo.id(), egui::vec2(38.0, 38.0))));
-            ui.vertical(|ui| {
+        egui::Frame::new()
+            .fill(egui::Color32::from_rgb(24, 28, 34))
+            .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(55, 61, 68)))
+            .inner_margin(egui::Margin::symmetric(14, 12))
+            .corner_radius(egui::CornerRadius::same(12))
+            .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new("Linux.do Accelerator")
-                            .font(FontId::proportional(18.0))
-                            .strong()
-                            .color(egui::Color32::from_rgb(244, 245, 247)),
-                    );
-                    ui.label(
-                        RichText::new(format!("v{APP_VERSION}"))
-                            .font(FontId::proportional(11.0))
-                            .color(egui::Color32::from_rgb(149, 159, 168)),
-                    );
-                    egui::Frame::new()
-                        .fill(accent.linear_multiply(0.12))
-                        .stroke(egui::Stroke::new(1.0, accent.linear_multiply(0.45)))
-                        .inner_margin(egui::Margin::symmetric(8, 3))
-                        .corner_radius(egui::CornerRadius::same(255))
-                        .show(ui, |ui| {
+                    ui.add(egui::Image::new((self.logo.id(), egui::vec2(30.0, 30.0))));
+                    ui.vertical(|ui| {
+                        ui.horizontal_wrapped(|ui| {
                             ui.label(
-                                RichText::new(headline)
-                                    .font(FontId::proportional(10.5))
+                                RichText::new(title)
+                                    .font(FontId::proportional(16.5))
                                     .strong()
-                                    .color(accent),
+                                    .color(egui::Color32::from_rgb(244, 245, 247)),
+                            );
+                            ui.label(
+                                RichText::new(format!("v{APP_VERSION}"))
+                                    .font(FontId::proportional(10.5))
+                                    .color(egui::Color32::from_rgb(149, 159, 168)),
                             );
                         });
+                        ui.label(
+                            RichText::new(summary)
+                                .font(FontId::proportional(11.0))
+                                .color(egui::Color32::from_rgb(159, 168, 176)),
+                        );
+                    });
+
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        egui::Frame::new()
+                            .fill(accent.linear_multiply(0.12))
+                            .stroke(egui::Stroke::new(1.0, accent.linear_multiply(0.45)))
+                            .inner_margin(egui::Margin::symmetric(10, 4))
+                            .corner_radius(egui::CornerRadius::same(255))
+                            .show(ui, |ui| {
+                                ui.label(
+                                    RichText::new(headline)
+                                        .font(FontId::proportional(10.5))
+                                        .strong()
+                                        .color(accent),
+                                );
+                            });
+                    });
                 });
-                ui.label(
-                    RichText::new("轻量本地加速工具")
-                        .font(FontId::proportional(11.5))
-                        .color(egui::Color32::from_rgb(151, 160, 169)),
-                );
             });
-        });
     }
 
     fn render_launcher_status_card(&self, ui: &mut egui::Ui) {
@@ -741,8 +751,8 @@ impl AcceleratorApp {
     }
 
     fn render_details_content(&self, ui: &mut egui::Ui) {
-        self.render_header(ui);
-        ui.add_space(10.0);
+        self.render_brand_banner(ui, "状态详情", "运行状态、接管范围与故障提示");
+        ui.add_space(8.0);
         if ui.available_width() >= 680.0 {
             ui.columns(2, |columns| {
                 columns[0].spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
@@ -763,7 +773,7 @@ impl AcceleratorApp {
     fn render_page_header(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, title: &str) {
         ui.horizontal(|ui| {
             if ui
-                .add(subtle_button("← 返回", egui::vec2(78.0, 28.0), true))
+                .add(subtle_button("← 返回", egui::vec2(76.0, 28.0), true))
                 .clicked()
             {
                 self.navigate_to(ctx, UiPage::Launcher);
@@ -772,20 +782,18 @@ impl AcceleratorApp {
             ui.vertical(|ui| {
                 ui.label(
                     RichText::new(title)
-                        .font(FontId::proportional(16.0))
+                        .font(FontId::proportional(15.5))
                         .strong()
                         .color(egui::Color32::from_rgb(244, 245, 247)),
                 );
                 ui.label(
-                    RichText::new("Linux.do Accelerator")
-                        .font(FontId::proportional(10.6))
+                    RichText::new("Linux.do Accelerator · 桌面工具")
+                        .font(FontId::proportional(10.3))
                         .color(egui::Color32::from_rgb(155, 164, 172)),
                 );
             });
         });
-        ui.add_space(8.0);
-        ui.separator();
-        ui.add_space(8.0);
+        ui.add_space(6.0);
     }
 
     fn navigate_to(&mut self, ctx: &egui::Context, page: UiPage) {
@@ -962,96 +970,167 @@ impl AcceleratorApp {
 
     fn render_config_content(&self, ui: &mut egui::Ui) {
         ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
+        self.render_brand_banner(
+            ui,
+            "设置总览",
+            "统一读取单个配置文件，修改后重新启动即可生效",
+        );
+        ui.add_space(8.0);
 
-        panel_frame(
-            egui::Color32::from_rgb(24, 28, 34),
-            egui::Color32::from_rgb(55, 61, 68),
-        )
-        .show(ui, |ui| {
-            ui.label(
-                RichText::new("配置总览")
-                    .font(FontId::proportional(15.0))
-                    .strong()
-                    .color(egui::Color32::from_rgb(243, 179, 74)),
-            );
-            ui.label(
-                RichText::new("当前使用单配置文件，修改后重新启动加速即可生效。")
-                    .font(FontId::proportional(11.0))
-                    .color(egui::Color32::from_rgb(171, 180, 187)),
-            );
-            ui.add_space(6.0);
-            detail_value_row(ui, "主配置", &self.config_path.display().to_string());
-            detail_value_row(ui, "上游", &self.config.upstream);
-            detail_value_row(
-                ui,
-                "DoH",
-                &self
-                    .config
-                    .doh_endpoints
-                    .first()
-                    .cloned()
-                    .unwrap_or_else(|| "未配置".to_string()),
-            );
-            ui.add_space(8.0);
-            ui.horizontal_wrapped(|ui| {
-                compact_metric(ui, "接管域名", &self.config.proxy_domains.len().to_string());
-                compact_metric(ui, "DoH 数量", &self.config.doh_endpoints.len().to_string());
-                compact_metric(
+        if ui.available_width() >= 680.0 {
+            ui.columns(2, |columns| {
+                columns[0].spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
+                panel_frame(
+                    egui::Color32::from_rgb(24, 28, 34),
+                    egui::Color32::from_rgb(55, 61, 68),
+                )
+                .show(&mut columns[0], |ui| {
+                    ui.label(
+                        RichText::new("配置文件")
+                            .font(FontId::proportional(13.0))
+                            .strong()
+                            .color(egui::Color32::from_rgb(243, 179, 74)),
+                    );
+                    ui.add_space(6.0);
+                    detail_value_row(ui, "主配置", &self.config_path.display().to_string());
+                    detail_value_row(ui, "上游", &self.config.upstream);
+                    detail_value_row(
+                        ui,
+                        "DoH 端点",
+                        &self
+                            .config
+                            .doh_endpoints
+                            .first()
+                            .cloned()
+                            .unwrap_or_else(|| "未配置".to_string()),
+                    );
+                });
+
+                columns[1].spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
+                panel_frame(
+                    egui::Color32::from_rgb(24, 28, 34),
+                    egui::Color32::from_rgb(55, 61, 68),
+                )
+                .show(&mut columns[1], |ui| {
+                    ui.label(
+                        RichText::new("接管统计")
+                            .font(FontId::proportional(13.0))
+                            .strong()
+                            .color(egui::Color32::from_rgb(243, 179, 74)),
+                    );
+                    ui.add_space(6.0);
+                    ui.columns(3, |columns| {
+                        scope_metric_card(
+                            &mut columns[0],
+                            "域名",
+                            &self.config.proxy_domains.len().to_string(),
+                        );
+                        scope_metric_card(
+                            &mut columns[1],
+                            "DoH",
+                            &self.config.doh_endpoints.len().to_string(),
+                        );
+                        scope_metric_card(
+                            &mut columns[2],
+                            "证书",
+                            &self.config.certificate_domains.len().to_string(),
+                        );
+                    });
+                    ui.add_space(8.0);
+                    subtle_note(
+                        ui,
+                        "配置文件改完后重新点击开始加速即可，不需要手动清理页面状态。",
+                    );
+                });
+            });
+        } else {
+            panel_frame(
+                egui::Color32::from_rgb(24, 28, 34),
+                egui::Color32::from_rgb(55, 61, 68),
+            )
+            .show(ui, |ui| {
+                detail_value_row(ui, "主配置", &self.config_path.display().to_string());
+                detail_value_row(ui, "上游", &self.config.upstream);
+                detail_value_row(
                     ui,
-                    "证书 SAN",
-                    &self.config.certificate_domains.len().to_string(),
+                    "DoH 端点",
+                    &self
+                        .config
+                        .doh_endpoints
+                        .first()
+                        .cloned()
+                        .unwrap_or_else(|| "未配置".to_string()),
                 );
             });
-        });
+        }
     }
 
     fn render_about_content(&self, ui: &mut egui::Ui) {
-        panel_frame(
-            egui::Color32::from_rgb(24, 28, 34),
-            egui::Color32::from_rgb(55, 61, 68),
-        )
-        .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.add(egui::Image::new((self.logo.id(), egui::vec2(40.0, 40.0))));
-                ui.vertical(|ui| {
+        self.render_brand_banner(ui, "关于项目", "面向 linux.do 的轻量本地加速工具与桌面壳");
+        ui.add_space(8.0);
+
+        if ui.available_width() >= 680.0 {
+            ui.columns(2, |columns| {
+                columns[0].spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
+                panel_frame(
+                    egui::Color32::from_rgb(24, 28, 34),
+                    egui::Color32::from_rgb(55, 61, 68),
+                )
+                .show(&mut columns[0], |ui| {
                     ui.label(
-                        RichText::new("Linux.do Accelerator")
-                            .font(FontId::proportional(17.0))
+                        RichText::new("产品信息")
+                            .font(FontId::proportional(13.0))
                             .strong()
-                            .color(egui::Color32::from_rgb(244, 245, 247)),
+                            .color(egui::Color32::from_rgb(243, 179, 74)),
                     );
+                    ui.add_space(6.0);
+                    detail_value_row(ui, "名称", "Linux.do Accelerator");
+                    detail_value_row(ui, "版本", &format!("v{APP_VERSION}"));
+                    detail_value_row(ui, "形态", "原生 Rust 桌面壳 + CLI");
+                });
+
+                columns[1].spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
+                panel_frame(
+                    egui::Color32::from_rgb(24, 28, 34),
+                    egui::Color32::from_rgb(55, 61, 68),
+                )
+                .show(&mut columns[1], |ui| {
                     ui.label(
-                        RichText::new(format!("版本 v{APP_VERSION}"))
-                            .font(FontId::proportional(11.2))
-                            .color(egui::Color32::from_rgb(171, 180, 187)),
+                        RichText::new("功能说明")
+                            .font(FontId::proportional(13.0))
+                            .strong()
+                            .color(egui::Color32::from_rgb(243, 179, 74)),
+                    );
+                    ui.add_space(6.0);
+                    about_bullet(
+                        ui,
+                        "支持证书安装、hosts 接管、本地 80/443 监听与 DoH 接管。",
+                    );
+                    about_bullet(ui, "DoH 与子域支持列表统一放在 linuxdo-accelerator.toml。");
+                    about_bullet(ui, "点击加速会触发管理员提权，后台启动守护进程。");
+                    about_bullet(
+                        ui,
+                        "如果提权失败、DoH 不可用或监听失败，界面会直接显示真实错误。",
                     );
                 });
             });
-            ui.add_space(8.0);
-            egui::Frame::new()
-                .fill(egui::Color32::from_rgb(19, 22, 27))
-                .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(45, 51, 58)))
-                .inner_margin(egui::Margin::symmetric(10, 8))
-                .corner_radius(egui::CornerRadius::same(8))
-                .show(ui, |ui| {
-                    ui.label(
-                        RichText::new("原生 Rust 桌面壳 + CLI")
-                            .font(FontId::proportional(11.8))
-                            .color(egui::Color32::from_rgb(214, 219, 223)),
-                    );
-                });
-            ui.add_space(6.0);
-            about_bullet(
-                ui,
-                "支持证书安装、hosts 接管、本地 80/443 监听与 DoH 接管。",
-            );
-            about_bullet(ui, "DoH 与子域支持列表统一放在 linuxdo-accelerator.toml。");
-            about_bullet(ui, "点击加速会触发管理员提权，后台启动守护进程。");
-            about_bullet(
-                ui,
-                "如果提权失败、DoH 不可用或监听失败，界面会直接显示真实错误。",
-            );
-        });
+        } else {
+            panel_frame(
+                egui::Color32::from_rgb(24, 28, 34),
+                egui::Color32::from_rgb(55, 61, 68),
+            )
+            .show(ui, |ui| {
+                detail_value_row(ui, "名称", "Linux.do Accelerator");
+                detail_value_row(ui, "版本", &format!("v{APP_VERSION}"));
+                detail_value_row(ui, "形态", "原生 Rust 桌面壳 + CLI");
+                ui.add_space(6.0);
+                about_bullet(
+                    ui,
+                    "支持证书安装、hosts 接管、本地 80/443 监听与 DoH 接管。",
+                );
+                about_bullet(ui, "DoH 与子域支持列表统一放在 linuxdo-accelerator.toml。");
+            });
+        }
     }
 
     fn show_confirm_action_dialog(&mut self, ctx: &egui::Context) {
@@ -1871,29 +1950,6 @@ fn subtle_button(
     })
 }
 
-fn compact_metric(ui: &mut egui::Ui, label: &str, value: &str) {
-    egui::Frame::new()
-        .fill(egui::Color32::from_rgb(19, 22, 27))
-        .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(46, 52, 60)))
-        .inner_margin(egui::Margin::symmetric(10, 8))
-        .corner_radius(egui::CornerRadius::same(8))
-        .show(ui, |ui| {
-            ui.vertical(|ui| {
-                ui.label(
-                    RichText::new(label)
-                        .font(FontId::proportional(10.0))
-                        .color(egui::Color32::from_rgb(160, 171, 179)),
-                );
-                ui.label(
-                    RichText::new(value)
-                        .font(FontId::proportional(14.0))
-                        .strong()
-                        .color(egui::Color32::from_rgb(243, 179, 74)),
-                );
-            });
-        });
-}
-
 fn scope_metric_card(ui: &mut egui::Ui, label: &str, value: &str) {
     egui::Frame::new()
         .fill(egui::Color32::from_rgb(19, 22, 27))
@@ -1917,6 +1973,21 @@ fn scope_metric_card(ui: &mut egui::Ui, label: &str, value: &str) {
                         .color(egui::Color32::from_rgb(243, 179, 74)),
                 );
             });
+        });
+}
+
+fn subtle_note(ui: &mut egui::Ui, text: &str) {
+    egui::Frame::new()
+        .fill(egui::Color32::from_rgb(19, 22, 27))
+        .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(46, 52, 60)))
+        .inner_margin(egui::Margin::symmetric(10, 8))
+        .corner_radius(egui::CornerRadius::same(8))
+        .show(ui, |ui| {
+            ui.label(
+                RichText::new(text)
+                    .font(FontId::proportional(10.9))
+                    .color(egui::Color32::from_rgb(186, 194, 201)),
+            );
         });
 }
 
