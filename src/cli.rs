@@ -118,14 +118,14 @@ pub fn run(cli: Cli) -> Result<()> {
             run_async(service::run_foreground(cli.config, false))?;
         }
         Some(Command::TrayShell) => {
-            #[cfg(target_os = "linux")]
+            #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
             {
                 let config_path = service::init_config(cli.config)?;
                 gui::run_tray_shell(config_path)?;
             }
-            #[cfg(not(target_os = "linux"))]
+            #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
             {
-                anyhow::bail!("tray-shell is only supported on Linux");
+                anyhow::bail!("tray-shell is not supported on this platform");
             }
         }
     }

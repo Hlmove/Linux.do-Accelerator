@@ -24,7 +24,6 @@ use crate::config::AppConfig;
 #[cfg(target_os = "windows")]
 use crate::paths::AppPaths;
 use crate::platform::run_elevated;
-#[cfg(target_os = "linux")]
 use crate::platform::spawn_detached;
 #[cfg(target_os = "windows")]
 use crate::platform::{
@@ -115,7 +114,7 @@ pub fn run_tray_shell(config_path: PathBuf) -> Result<()> {
                 TrayCommand::Restore => {
                     log_linux_tray_event("tray-shell restore clicked");
                     let _ = tray_icon.set_visible(false);
-                    let _ = spawn_linux_ui_process(&config_for_timeout);
+                    let _ = spawn_ui_process(&config_for_timeout);
                     gtk::main_quit();
                     return ControlFlow::Break;
                 }
@@ -134,6 +133,129 @@ pub fn run_tray_shell(config_path: PathBuf) -> Result<()> {
     gtk::main();
     log_linux_tray_event("tray-shell exit");
     Ok(())
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+pub fn run_tray_shell(config_path: PathBuf) -> Result<()> {
+    use winit::application::ApplicationHandler;
+    use winit::event::StartCause;
+    use winit::event_loop::{ActiveEventLoop, EventLoop};
+
+    #[derive(Debug)]
+    enum TrayShellEvent {
+        Restore,
+        Quit,
+    }
+
+    struct TrayShellApp {
+        config_path: PathBuf,
+        tray_icon: Option<TrayIcon>,
+        show_item: MenuItem,
+        quit_item: MenuItem,
+    }
+
+    impl TrayShellApp {
+        fn create_tray_icon(&mut self) -> Result<()> {
+            if self.tray_icon.is_some() {
+                return Ok(());
+            }
+
+            let menu = Menu::new();
+            menu.append_items(&[
+                &self.show_item,
+                &PredefinedMenuItem::separator(),
+                &self.quit_item,
+            ])?;
+
+            let tray_icon = TrayIconBuilder::new()
+                .with_id("linuxdo-accelerator-tray-shell")
+                .with_menu(Box::new(menu))
+                .with_menu_on_left_click(false)
+                .with_tooltip("Linux.do Accelerator")
+                .with_icon(tray_window_icon()?)
+                .build()
+                .context("failed to create tray shell icon")?;
+            self.tray_icon = Some(tray_icon);
+            Ok(())
+        }
+    }
+
+    impl ApplicationHandler<TrayShellEvent> for TrayShellApp {
+        fn resumed(&mut self, _event_loop: &ActiveEventLoop) {}
+
+        fn window_event(
+            &mut self,
+            _event_loop: &ActiveEventLoop,
+            _window_id: winit::window::WindowId,
+            _event: winit::event::WindowEvent,
+        ) {
+        }
+
+        fn new_events(&mut self, event_loop: &ActiveEventLoop, cause: StartCause) {
+            if cause == StartCause::Init && self.create_tray_icon().is_err() {
+                event_loop.exit();
+            }
+        }
+
+        fn user_event(&mut self, event_loop: &ActiveEventLoop, event: TrayShellEvent) {
+            match event {
+                TrayShellEvent::Restore => {
+                    let _ = spawn_ui_process(&self.config_path);
+                    event_loop.exit();
+                }
+                TrayShellEvent::Quit => {
+                    event_loop.exit();
+                }
+            }
+        }
+    }
+
+    let show_item = MenuItem::with_id("tray-show", "打开窗口", true, None);
+    let quit_item = MenuItem::with_id("tray-quit", "退出程序", true, None);
+    let show_id = show_item.id().clone();
+    let quit_id = quit_item.id().clone();
+
+    let event_loop = EventLoop::<TrayShellEvent>::with_user_event()
+        .build()
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+
+    let proxy = event_loop.create_proxy();
+    TrayIconEvent::set_event_handler(Some(move |event| match event {
+        TrayIconEvent::Click {
+            button: MouseButton::Left,
+            button_state: MouseButtonState::Up,
+            ..
+        }
+        | TrayIconEvent::DoubleClick {
+            button: MouseButton::Left,
+            ..
+        } => {
+            let _ = proxy.send_event(TrayShellEvent::Restore);
+        }
+        _ => {}
+    }));
+
+    let proxy = event_loop.create_proxy();
+    MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
+        if event.id == show_id {
+            let _ = proxy.send_event(TrayShellEvent::Restore);
+        } else if event.id == quit_id {
+            let _ = proxy.send_event(TrayShellEvent::Quit);
+        }
+    }));
+
+    let mut app = TrayShellApp {
+        config_path,
+        tray_icon: None,
+        show_item,
+        quit_item,
+    };
+    let result = event_loop
+        .run_app(&mut app)
+        .map_err(|error| anyhow::anyhow!(error.to_string()));
+    TrayIconEvent::set_event_handler::<fn(TrayIconEvent)>(None);
+    MenuEvent::set_event_handler::<fn(MenuEvent)>(None);
+    result
 }
 
 struct AcceleratorApp {
@@ -747,25 +869,30 @@ impl AcceleratorApp {
 
     #[cfg(target_os = "windows")]
     fn minimize_to_tray(&mut self, ctx: &egui::Context) {
-        if let Some(tray) = &self.tray {
-            let _ = tray.tray_icon.set_visible(true);
+        match spawn_tray_shell(&self.config_path) {
+            Ok(()) => {
+                self.hidden_to_tray = true;
+                self.last_minimized = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            Err(error) => {
+                if let Some(tray) = &self.tray {
+                    let _ = tray.tray_icon.set_visible(true);
+                }
+                self.hidden_to_tray = true;
+                self.last_minimized = false;
+                self.feedback = format!("托盘最小化失败，已退回隐藏窗口模式: {error}");
+                if let Some(hwnd) = self.window_handle {
+                    let _ = hide_app_window(hwnd);
+                }
+                ctx.request_repaint();
+            }
         }
-        self.hidden_to_tray = true;
-        self.last_minimized = false;
-        self.feedback = if self.status.running {
-            "已最小化到系统托盘，后台加速仍在继续".to_string()
-        } else {
-            "已最小化到系统托盘".to_string()
-        };
-        if let Some(hwnd) = self.window_handle {
-            let _ = hide_app_window(hwnd);
-        }
-        ctx.request_repaint();
     }
 
     #[cfg(target_os = "linux")]
     fn minimize_to_tray(&mut self, ctx: &egui::Context) {
-        match spawn_linux_tray_shell(&self.config_path) {
+        match spawn_tray_shell(&self.config_path) {
             Ok(()) => {
                 self.hidden_to_tray = true;
                 self.last_minimized = true;
@@ -782,18 +909,23 @@ impl AcceleratorApp {
 
     #[cfg(target_os = "macos")]
     fn minimize_to_tray(&mut self, ctx: &egui::Context) {
-        if let Some(tray) = &self.tray {
-            let _ = tray.tray_icon.set_visible(true);
+        match spawn_tray_shell(&self.config_path) {
+            Ok(()) => {
+                self.hidden_to_tray = true;
+                self.last_minimized = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            Err(error) => {
+                if let Some(tray) = &self.tray {
+                    let _ = tray.tray_icon.set_visible(true);
+                }
+                self.hidden_to_tray = true;
+                self.last_minimized = false;
+                self.feedback = format!("托盘最小化失败，已退回隐藏窗口模式: {error}");
+                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+                ctx.request_repaint();
+            }
         }
-        self.hidden_to_tray = true;
-        self.last_minimized = false;
-        self.feedback = if self.status.running {
-            "已最小化到菜单栏，后台加速仍在继续".to_string()
-        } else {
-            "已最小化到菜单栏".to_string()
-        };
-        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
-        ctx.request_repaint();
     }
 
     #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
@@ -1176,37 +1308,39 @@ fn file_modified_at(path: &Path) -> Option<SystemTime> {
     fs::metadata(path).ok()?.modified().ok()
 }
 
-#[cfg(target_os = "linux")]
-fn spawn_linux_tray_shell(config_path: &Path) -> Result<()> {
+#[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
+fn spawn_tray_shell(config_path: &Path) -> Result<()> {
     let gui_binary = locate_gui_binary()?;
     let args = vec![
         "--config".to_string(),
         config_path.to_string_lossy().into_owned(),
         "tray-shell".to_string(),
     ];
+    #[cfg(target_os = "linux")]
     log_linux_tray_event(&format!(
         "spawn tray-shell exe={} config={}",
         gui_binary.display(),
         config_path.display()
     ));
-    spawn_detached(&gui_binary, &args).context("failed to start Linux tray shell")?;
+    spawn_detached(&gui_binary, &args).context("failed to start tray shell")?;
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
-fn spawn_linux_ui_process(config_path: &Path) -> Result<()> {
+#[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
+fn spawn_ui_process(config_path: &Path) -> Result<()> {
     let gui_binary = locate_gui_binary()?;
     let args = vec![
         "--config".to_string(),
         config_path.to_string_lossy().into_owned(),
         "gui".to_string(),
     ];
+    #[cfg(target_os = "linux")]
     log_linux_tray_event(&format!(
         "spawn ui exe={} config={}",
         gui_binary.display(),
         config_path.display()
     ));
-    spawn_detached(&gui_binary, &args).context("failed to reopen Linux UI")?;
+    spawn_detached(&gui_binary, &args).context("failed to reopen UI")?;
     Ok(())
 }
 
@@ -1222,7 +1356,6 @@ fn locate_action_binary() -> Result<PathBuf> {
     locate_current_or_sibling_binary(action_binary_name())
 }
 
-#[cfg(target_os = "linux")]
 fn locate_gui_binary() -> Result<PathBuf> {
     locate_current_or_sibling_binary(gui_binary_name())
 }
@@ -1253,7 +1386,6 @@ fn action_binary_name() -> &'static str {
     }
 }
 
-#[cfg(target_os = "linux")]
 fn gui_binary_name() -> &'static str {
     action_binary_name()
 }
