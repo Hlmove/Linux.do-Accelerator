@@ -7,3 +7,4 @@ release-downloads/
 android/.gradle/
 android/.kotlin/
 android/**/build/
+.tmp/

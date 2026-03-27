@@ -23,6 +23,8 @@ pub struct AppConfig {
     pub fake_sni: Option<String>,
     #[serde(default = "default_doh_endpoints")]
     pub doh_endpoints: Vec<String>,
+    #[serde(default = "default_managed_prefer_ipv6")]
+    pub managed_prefer_ipv6: bool,
     #[serde(default)]
     pub dns_hosts: BTreeMap<String, String>,
     #[serde(default = "default_proxy_domains")]
@@ -91,6 +93,10 @@ fn default_doh_endpoints() -> Vec<String> {
     default_app_config().doh_endpoints
 }
 
+fn default_managed_prefer_ipv6() -> bool {
+    false
+}
+
 fn default_proxy_domains() -> Vec<String> {
     default_app_config().proxy_domains
 }
@@ -157,6 +163,7 @@ impl AppConfig {
                 .map(|value| value.doh_endpoints.clone())
                 .filter(|value| !value.is_empty())
                 .unwrap_or_else(default_doh_endpoints),
+            managed_prefer_ipv6: default_managed_prefer_ipv6(),
             dns_hosts: BTreeMap::new(),
             proxy_domains: legacy_network
                 .as_ref()

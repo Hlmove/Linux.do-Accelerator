@@ -17,6 +17,7 @@ use hyper::client::conn::http2 as client_http2;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::server::conn::auto;
 use reqwest::Client;
 use rustls::SignatureScheme;
 use rustls::client::{EchConfig, EchMode};
@@ -40,8 +41,10 @@ use crate::config::AppConfig;
 struct AppState {
     config: AppConfig,
     doh_client: Client,
+    upstream_tls_connector: TlsConnector,
     resolve_cache: RwLock<HashMap<ResolveCacheKey, CachedResolvedUpstream>>,
     doh_cache: RwLock<HashMap<DohCacheKey, CachedDohAnswers>>,
+    preferred_upstream_addr: RwLock<HashMap<ResolveCacheKey, SocketAddr>>,
 }
 
 #[derive(Clone, Debug)]
@@ -99,19 +102,33 @@ struct DohAnswer {
     data: String,
 }
 const FALLBACK_RESOLVE_CACHE_TTL: Duration = Duration::from_secs(300);
+const DOH_CONNECT_TIMEOUT: Duration = Duration::from_secs(4);
+const DOH_REQUEST_TIMEOUT: Duration = Duration::from_secs(6);
+const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(4);
 
 pub async fn run_proxy(config: AppConfig, bundle: CertificateBundle) -> Result<()> {
     let doh_client = Client::builder()
-        .http1_only()
-        .connect_timeout(Duration::from_secs(10))
-        .timeout(Duration::from_secs(15))
+        .connect_timeout(DOH_CONNECT_TIMEOUT)
+        .timeout(DOH_REQUEST_TIMEOUT)
+        .pool_idle_timeout(Duration::from_secs(30))
+        .tcp_keepalive(Duration::from_secs(30))
         .build()
         .context("failed to build DoH client")?;
+    let provider = aws_lc_rs::default_provider();
+    let mut upstream_tls_config = ClientConfig::builder_with_provider(provider.into())
+        .with_safe_default_protocol_versions()
+        .context("failed to configure upstream TLS versions")?
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(NoCertificateVerification))
+        .with_no_client_auth();
+    upstream_tls_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
     let state = Arc::new(AppState {
         config,
         doh_client,
+        upstream_tls_connector: TlsConnector::from(Arc::new(upstream_tls_config)),
         resolve_cache: RwLock::new(HashMap::new()),
         doh_cache: RwLock::new(HashMap::new()),
+        preferred_upstream_addr: RwLock::new(HashMap::new()),
     });
     let http_state = state.clone();
     let https_state = state.clone();
@@ -162,7 +179,7 @@ async fn run_https_proxy(state: Arc<AppState>, bundle: CertificateBundle) -> Res
         .with_no_client_auth()
         .with_single_cert(certs, key)
         .context("failed to build rustls server config")?;
-    tls_config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    tls_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
 
     let acceptor = TlsAcceptor::from(Arc::new(tls_config));
     let address = format!("{}:{}", state.config.listen_host, state.config.https_port);
@@ -190,7 +207,11 @@ async fn run_https_proxy(state: Arc<AppState>, bundle: CertificateBundle) -> Res
             };
 
             let service = service_fn(move |request| proxy_handler(request, state.clone()));
-            if let Err(error) = http1::Builder::new()
+            let mut builder = auto::Builder::new(TokioExecutor::new());
+            builder.http1().keep_alive(true);
+            builder.http2().adaptive_window(true);
+            builder.http2().keep_alive_interval(None);
+            if let Err(error) = builder
                 .serve_connection(TokioIo::new(tls_stream), service)
                 .await
             {
@@ -327,69 +348,44 @@ async fn dispatch_upstream_request(
     path_and_query: &str,
 ) -> Result<Response<Incoming>> {
     let upstream = resolve_upstream(state, request_host, upstream_port).await?;
+    let ech_config = upstream
+        .ech_config
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("ECH 强制模式：{request_host} 未提供可用的 ECH 配置"))?;
+
     let mut last_error = None;
-
-    if upstream.ech_config.is_some() {
-        for addr in upstream.addrs.iter().copied() {
-            match send_once(
-                upstream_scheme,
-                request_host,
-                None,
-                upstream.ech_config.clone(),
-                addr,
-                method.clone(),
-                headers.clone(),
-                body.clone(),
-                path_and_query,
-            )
-            .await
-            {
-                Ok(response) => return Ok(response),
-                Err(error) => {
-                    eprintln!(
-                        "ech upstream attempt failed for {request_host} via {addr}: {error:#}"
-                    );
-                    last_error = Some(error);
-                }
+    for addr in upstream.addrs.iter().copied() {
+        match send_once(
+            state,
+            upstream_scheme,
+            request_host,
+            None,
+            Some(ech_config.clone()),
+            addr,
+            method.clone(),
+            headers.clone(),
+            body.clone(),
+            path_and_query,
+        )
+        .await
+        {
+            Ok(response) => {
+                remember_successful_upstream(state, request_host, upstream_port, addr).await;
+                return Ok(response);
+            }
+            Err(error) => {
+                eprintln!("ech upstream attempt failed for {request_host} via {addr}: {error:#}");
+                last_error = Some(error);
             }
         }
     }
 
-    let sni_candidates = effective_fake_sni_candidates(&state.config);
-    for sni_name in sni_candidates {
-        for addr in upstream.addrs.iter().copied() {
-            match send_once(
-                upstream_scheme,
-                request_host,
-                Some(&sni_name),
-                None,
-                addr,
-                method.clone(),
-                headers.clone(),
-                body.clone(),
-                path_and_query,
-            )
-            .await
-            {
-                Ok(response) => {
-                    if should_retry_front_status(response.status()) {
-                        last_error = Some(anyhow::anyhow!(
-                            "front domain {sni_name} returned retryable status {}",
-                            response.status()
-                        ));
-                        continue;
-                    }
-                    return Ok(response);
-                }
-                Err(error) => last_error = Some(error),
-            }
-        }
-    }
-
-    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("no usable upstream address")))
+    Err(last_error
+        .unwrap_or_else(|| anyhow::anyhow!("ECH 强制模式：{request_host} 所有上游地址都握手失败")))
 }
 
 async fn send_once(
+    state: &AppState,
     upstream_scheme: &str,
     request_host: &str,
     outer_sni: Option<&str>,
@@ -407,7 +403,7 @@ async fn send_once(
         return send_over_io(TokioIo::new(stream), request).await;
     }
 
-    let tls_stream = connect_tls(request_host, outer_sni, ech_config, addr).await?;
+    let tls_stream = connect_tls(state, request_host, outer_sni, ech_config, addr).await?;
     let negotiated_h2 = tls_stream.get_ref().1.alpn_protocol() == Some(b"h2");
     if negotiated_h2 {
         return send_over_io_http2(TokioIo::new(tls_stream), request).await;
@@ -461,7 +457,9 @@ async fn send_over_io_http2<T>(
 where
     T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    let (mut sender, connection) = client_http2::Builder::new(TokioExecutor::new())
+    let mut builder = client_http2::Builder::new(TokioExecutor::new());
+    builder.adaptive_window(true);
+    let (mut sender, connection) = builder
         .handshake(io)
         .await
         .context("failed to initialize upstream HTTP/2 client")?;
@@ -475,6 +473,7 @@ where
 }
 
 async fn connect_tls(
+    state: &AppState,
     request_host: &str,
     outer_sni: Option<&str>,
     ech_config: Option<EchConfig>,
@@ -482,27 +481,22 @@ async fn connect_tls(
 ) -> Result<TlsStream<tokio::net::TcpStream>> {
     let tcp = connect_tcp(addr).await?;
 
-    let provider = aws_lc_rs::default_provider();
-    let mut tls_config = if let Some(ech_config) = ech_config {
-        ClientConfig::builder_with_provider(provider.into())
+    let connector = if let Some(ech_config) = ech_config {
+        let provider = aws_lc_rs::default_provider();
+        let mut tls_config = ClientConfig::builder_with_provider(provider.into())
             .with_ech(EchMode::Enable(ech_config))
             .context("failed to configure upstream ECH mode")?
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(NoCertificateVerification))
-            .with_no_client_auth()
+            .with_no_client_auth();
+        tls_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        TlsConnector::from(Arc::new(tls_config))
     } else {
-        ClientConfig::builder_with_provider(provider.into())
-            .with_safe_default_protocol_versions()
-            .context("failed to configure upstream TLS versions")?
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(NoCertificateVerification))
-            .with_no_client_auth()
+        state.upstream_tls_connector.clone()
     };
-    tls_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
 
     let server_name = ServerName::try_from(outer_sni.unwrap_or(request_host).to_string())
         .context("failed to construct upstream SNI name")?;
-    let connector = TlsConnector::from(Arc::new(tls_config));
     connector
         .connect(server_name, tcp)
         .await
@@ -510,13 +504,17 @@ async fn connect_tls(
 }
 
 async fn connect_tcp(addr: SocketAddr) -> Result<tokio::net::TcpStream> {
-    tokio::time::timeout(
-        std::time::Duration::from_secs(5),
+    let stream = tokio::time::timeout(
+        UPSTREAM_CONNECT_TIMEOUT,
         tokio::net::TcpStream::connect(addr),
     )
     .await
     .with_context(|| format!("timed out connecting upstream {addr}"))?
-    .with_context(|| format!("failed to connect upstream {addr}"))
+    .with_context(|| format!("failed to connect upstream {addr}"))?;
+    stream
+        .set_nodelay(true)
+        .with_context(|| format!("failed to enable TCP_NODELAY for upstream {addr}"))?;
+    Ok(stream)
 }
 
 async fn resolve_upstream(state: &AppState, host: &str, port: u16) -> Result<ResolvedUpstream> {
@@ -533,6 +531,8 @@ async fn resolve_upstream(state: &AppState, host: &str, port: u16) -> Result<Res
         port,
     };
     if let Some(cached) = read_cached_upstream(state, &cache_key).await {
+        let mut cached = cached;
+        prioritize_preferred_upstream(state, &cache_key, &mut cached.addrs).await;
         return Ok(cached);
     }
 
@@ -621,7 +621,8 @@ async fn resolve_upstream(state: &AppState, host: &str, port: u16) -> Result<Res
         .into_iter()
         .map(|ip| SocketAddr::new(ip, port))
         .collect::<Vec<_>>();
-    let upstream = ResolvedUpstream { addrs, ech_config };
+    let mut upstream = ResolvedUpstream { addrs, ech_config };
+    prioritize_preferred_upstream(state, &cache_key, &mut upstream.addrs).await;
     let resolve_ttl = min_duration_options(binding_ttl, min_duration_options(addr_ttl, extra_ttl))
         .unwrap_or(FALLBACK_RESOLVE_CACHE_TTL);
     write_cached_upstream(state, cache_key, upstream.clone(), resolve_ttl).await;
@@ -643,22 +644,38 @@ async fn doh_lookup_ip_addrs(
 ) -> Result<(Vec<IpAddr>, Option<Duration>)> {
     let mut addrs = Vec::new();
 
-    let (ipv6_answers, ipv4_answers) =
-        tokio::try_join!(doh_query(state, host, "AAAA"), doh_query(state, host, "A"))?;
+    let (ipv4_answers, ipv6_answers) =
+        tokio::try_join!(doh_query(state, host, "A"), doh_query(state, host, "AAAA"))?;
 
-    for answer in &ipv6_answers {
-        if answer.record_type == 28
-            && let Ok(ip) = answer.data.parse::<std::net::Ipv6Addr>()
-        {
-            addrs.push(IpAddr::V6(ip));
+    if state.config.managed_prefer_ipv6 {
+        for answer in &ipv6_answers {
+            if answer.record_type == 28
+                && let Ok(ip) = answer.data.parse::<std::net::Ipv6Addr>()
+            {
+                addrs.push(IpAddr::V6(ip));
+            }
         }
-    }
-
-    for answer in &ipv4_answers {
-        if answer.record_type == 1
-            && let Ok(ip) = answer.data.parse::<std::net::Ipv4Addr>()
-        {
-            addrs.push(IpAddr::V4(ip));
+        for answer in &ipv4_answers {
+            if answer.record_type == 1
+                && let Ok(ip) = answer.data.parse::<std::net::Ipv4Addr>()
+            {
+                addrs.push(IpAddr::V4(ip));
+            }
+        }
+    } else {
+        for answer in &ipv4_answers {
+            if answer.record_type == 1
+                && let Ok(ip) = answer.data.parse::<std::net::Ipv4Addr>()
+            {
+                addrs.push(IpAddr::V4(ip));
+            }
+        }
+        for answer in &ipv6_answers {
+            if answer.record_type == 28
+                && let Ok(ip) = answer.data.parse::<std::net::Ipv6Addr>()
+            {
+                addrs.push(IpAddr::V6(ip));
+            }
         }
     }
 
@@ -700,16 +717,27 @@ async fn doh_query(state: &AppState, host: &str, record_type: &str) -> Result<Ve
         return Ok(cached);
     }
 
-    let endpoint =
-        state.config.doh_endpoints.first().ok_or_else(|| {
-            anyhow::anyhow!("DoH 不可用，请在配置中自行更换 DoH：未配置 DoH 端点")
-        })?;
+    if state.config.doh_endpoints.is_empty() {
+        anyhow::bail!("DoH 不可用，请在配置中自行更换 DoH：未配置 DoH 端点");
+    }
 
-    let answers = doh_query_once(&state.doh_client, endpoint, host, record_type)
-        .await
-        .with_context(|| format!("DoH 不可用，请在配置中自行更换 DoH：{endpoint}"))?;
-    write_cached_doh_answers(state, cache_key, answers.clone()).await;
-    Ok(answers)
+    let mut last_error = None;
+    for endpoint in &state.config.doh_endpoints {
+        match doh_query_once(&state.doh_client, endpoint, host, record_type).await {
+            Ok(answers) => {
+                write_cached_doh_answers(state, cache_key, answers.clone()).await;
+                return Ok(answers);
+            }
+            Err(error) => {
+                eprintln!("DoH query {record_type} {host} via {endpoint} failed: {error:#}");
+                last_error = Some(anyhow::anyhow!(
+                    "DoH 不可用，请在配置中自行更换 DoH：{endpoint}: {error:#}"
+                ));
+            }
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("DoH 不可用：所有 DoH 端点都失败了")))
 }
 
 async fn read_cached_upstream(state: &AppState, key: &ResolveCacheKey) -> Option<ResolvedUpstream> {
@@ -721,6 +749,33 @@ async fn read_cached_upstream(state: &AppState, key: &ResolveCacheKey) -> Option
             None
         }
     })
+}
+
+async fn prioritize_preferred_upstream(
+    state: &AppState,
+    key: &ResolveCacheKey,
+    addrs: &mut Vec<SocketAddr>,
+) {
+    let preferred = {
+        let preferred = state.preferred_upstream_addr.read().await;
+        preferred.get(key).copied()
+    };
+
+    if let Some(preferred) = preferred
+        && let Some(index) = addrs.iter().position(|addr| *addr == preferred)
+        && index > 0
+    {
+        addrs.swap(0, index);
+    }
+}
+
+async fn remember_successful_upstream(state: &AppState, host: &str, port: u16, addr: SocketAddr) {
+    let key = ResolveCacheKey {
+        host: host.to_ascii_lowercase(),
+        port,
+    };
+    let mut preferred = state.preferred_upstream_addr.write().await;
+    preferred.insert(key, addr);
 }
 
 async fn write_cached_upstream(
@@ -1024,39 +1079,6 @@ fn read_u16(bytes: &[u8], offset: usize) -> Result<u16> {
         .get(offset..offset + 2)
         .context("truncated u16 field while parsing ECH config")?;
     Ok(u16::from_be_bytes([slice[0], slice[1]]))
-}
-
-fn effective_fake_sni_candidates(config: &AppConfig) -> Vec<String> {
-    let mut candidates = Vec::new();
-    if let Some(fake_sni) = config.fake_sni.as_ref()
-        && !fake_sni.trim().is_empty()
-    {
-        candidates.push(fake_sni.trim().to_string());
-    }
-
-    for candidate in [
-        "www.cloudflare.com".to_string(),
-        "cdnjs.cloudflare.com".to_string(),
-        "developers.cloudflare.com".to_string(),
-        "dash.cloudflare.com".to_string(),
-        "one.one.one.one".to_string(),
-    ] {
-        if !candidates.contains(&candidate) {
-            candidates.push(candidate);
-        }
-    }
-
-    candidates
-}
-
-fn should_retry_front_status(status: StatusCode) -> bool {
-    matches!(
-        status,
-        StatusCode::BAD_REQUEST
-            | StatusCode::FORBIDDEN
-            | StatusCode::MISDIRECTED_REQUEST
-            | StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE
-    )
 }
 
 #[derive(Debug)]

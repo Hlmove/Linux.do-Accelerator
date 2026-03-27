@@ -8,7 +8,7 @@ fake_sni = "www.cloudflare.com"
 doh_endpoints = [
     "https://aaa.ddd.oaifree.com/query-dns",
 ]
-managed_prefer_ipv6 = true
+managed_prefer_ipv6 = false
 dns_hosts = {}
 # example:
 # dns_hosts = { "example.com" = "1.1.1.1", "*.example.com" = "domain:real.example.net" }
