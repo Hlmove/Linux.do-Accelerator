@@ -52,12 +52,12 @@ python3 -m dmgbuild \
   -D "app=${app_path}" \
   -D "volume_name=${product_name}" \
   -D "background=assets/dmg/background.png" \
-  -D "window_width=720" \
-  -D "window_height=460" \
-  -D "app_x=160" \
-  -D "app_y=220" \
-  -D "apps_x=560" \
-  -D "apps_y=220" \
+  -D "window_width=760" \
+  -D "window_height=480" \
+  -D "app_x=178" \
+  -D "app_y=222" \
+  -D "apps_x=582" \
+  -D "apps_y=222" \
   "${product_name}" \
   "${dmg_path}"
 
