@@ -37,9 +37,12 @@ use tokio_rustls::rustls::{ClientConfig, DigitallySignedStruct, Error as RustlsE
 
 use crate::certs::CertificateBundle;
 use crate::config::AppConfig;
+use crate::paths::AppPaths;
+use crate::runtime_log;
 
 struct AppState {
     config: AppConfig,
+    paths: AppPaths,
     doh_client: Client,
     upstream_tls_connector: TlsConnector,
     resolve_cache: RwLock<HashMap<ResolveCacheKey, CachedResolvedUpstream>>,
@@ -77,6 +80,11 @@ struct CachedDohAnswers {
     expires_at: Instant,
 }
 
+struct UpstreamResponse {
+    response: Response<Incoming>,
+    negotiated_protocol: &'static str,
+}
+
 #[derive(Debug, Default)]
 struct HttpsServiceBinding {
     priority: u16,
@@ -106,7 +114,7 @@ const DOH_CONNECT_TIMEOUT: Duration = Duration::from_secs(4);
 const DOH_REQUEST_TIMEOUT: Duration = Duration::from_secs(6);
 const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(4);
 
-pub async fn run_proxy(config: AppConfig, bundle: CertificateBundle) -> Result<()> {
+pub async fn run_proxy(config: AppConfig, paths: AppPaths, bundle: CertificateBundle) -> Result<()> {
     let doh_client = Client::builder()
         .connect_timeout(DOH_CONNECT_TIMEOUT)
         .timeout(DOH_REQUEST_TIMEOUT)
@@ -124,6 +132,7 @@ pub async fn run_proxy(config: AppConfig, bundle: CertificateBundle) -> Result<(
     upstream_tls_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
     let state = Arc::new(AppState {
         config,
+        paths,
         doh_client,
         upstream_tls_connector: TlsConnector::from(Arc::new(upstream_tls_config)),
         resolve_cache: RwLock::new(HashMap::new()),
@@ -225,7 +234,7 @@ async fn redirect_handler(
     request: Request<Incoming>,
     state: Arc<AppState>,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
-    let host = extract_host(request.headers(), &state.config)
+    let host = extract_host(request.headers(), request.uri(), &state.config)
         .unwrap_or_else(|| state.config.server_common_name.clone());
     let path = request
         .uri()
@@ -251,7 +260,7 @@ async fn proxy_handler(
     request: Request<Incoming>,
     state: Arc<AppState>,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
-    let host = match extract_host(request.headers(), &state.config) {
+    let host = match extract_host(request.headers(), request.uri(), &state.config) {
         Some(host) => host,
         None => {
             return Ok(simple_response(
@@ -315,9 +324,10 @@ async fn forward_request(
     )
     .await?;
 
-    let status = upstream_response.status();
-    let headers = upstream_response.headers().clone();
+    let status = upstream_response.response.status();
+    let headers = upstream_response.response.headers().clone();
     let body = upstream_response
+        .response
         .into_body()
         .collect()
         .await
@@ -346,7 +356,7 @@ async fn dispatch_upstream_request(
     headers: HeaderMap,
     body: Bytes,
     path_and_query: &str,
-) -> Result<Response<Incoming>> {
+) -> Result<UpstreamResponse> {
     let upstream = resolve_upstream(state, request_host, upstream_port).await?;
     let ech_config = upstream
         .ech_config
@@ -355,6 +365,20 @@ async fn dispatch_upstream_request(
 
     let mut last_error = None;
     for addr in upstream.addrs.iter().copied() {
+        log_upstream_debug(
+            state,
+            request_host,
+            path_and_query,
+            &format!(
+                "attempt addr={addr} scheme={upstream_scheme} ech={} edge_node={}",
+                if upstream.ech_config.is_some() { "yes" } else { "no" },
+                state
+                    .config
+                    .edge_node_override()
+                    .filter(|value| !value.trim().is_empty())
+                    .unwrap_or("-")
+            ),
+        );
         match send_once(
             state,
             upstream_scheme,
@@ -371,9 +395,37 @@ async fn dispatch_upstream_request(
         {
             Ok(response) => {
                 remember_successful_upstream(state, request_host, upstream_port, addr).await;
+                let status = response.response.status();
+                let cf_ray = response
+                    .response
+                    .headers()
+                    .get("cf-ray")
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or("-");
+                let content_type = response
+                    .response
+                    .headers()
+                    .get("content-type")
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or("-");
+                log_upstream_debug(
+                    state,
+                    request_host,
+                    path_and_query,
+                    &format!(
+                        "success addr={addr} protocol={} status={} cf-ray={} content-type={}",
+                        response.negotiated_protocol, status, cf_ray, content_type
+                    ),
+                );
                 return Ok(response);
             }
             Err(error) => {
+                log_upstream_debug(
+                    state,
+                    request_host,
+                    path_and_query,
+                    &format!("failure addr={addr} error={error:#}"),
+                );
                 eprintln!("ech upstream attempt failed for {request_host} via {addr}: {error:#}");
                 last_error = Some(error);
             }
@@ -395,20 +447,29 @@ async fn send_once(
     headers: HeaderMap,
     body: Bytes,
     path_and_query: &str,
-) -> Result<Response<Incoming>> {
+) -> Result<UpstreamResponse> {
     let request = build_upstream_request(request_host, method, headers, body, path_and_query)?;
 
     if upstream_scheme.eq_ignore_ascii_case("http") {
         let stream = connect_tcp(addr).await?;
-        return send_over_io(TokioIo::new(stream), request).await;
+        return Ok(UpstreamResponse {
+            response: send_over_io(TokioIo::new(stream), request).await?,
+            negotiated_protocol: "http/1.1",
+        });
     }
 
     let tls_stream = connect_tls(state, request_host, outer_sni, ech_config, addr).await?;
     let negotiated_h2 = tls_stream.get_ref().1.alpn_protocol() == Some(b"h2");
     if negotiated_h2 {
-        return send_over_io_http2(TokioIo::new(tls_stream), request).await;
+        return Ok(UpstreamResponse {
+            response: send_over_io_http2(TokioIo::new(tls_stream), request).await?,
+            negotiated_protocol: "h2",
+        });
     }
-    send_over_io(TokioIo::new(tls_stream), request).await
+    Ok(UpstreamResponse {
+        response: send_over_io(TokioIo::new(tls_stream), request).await?,
+        negotiated_protocol: "http/1.1",
+    })
 }
 
 fn build_upstream_request(
@@ -538,6 +599,16 @@ async fn resolve_upstream(state: &AppState, host: &str, port: u16) -> Result<Res
     if let Some(cached) = read_cached_upstream(state, &cache_key).await {
         let mut cached = cached;
         prioritize_preferred_upstream(state, &cache_key, &mut cached.addrs).await;
+        log_upstream_debug(
+            state,
+            host,
+            "/",
+            &format!(
+                "resolve cache-hit addrs={} ech={}",
+                format_socket_addrs(&cached.addrs),
+                if cached.ech_config.is_some() { "yes" } else { "no" }
+            ),
+        );
         return Ok(cached);
     }
 
@@ -638,6 +709,21 @@ async fn resolve_upstream(state: &AppState, host: &str, port: u16) -> Result<Res
         .collect::<Vec<_>>();
     let mut upstream = ResolvedUpstream { addrs, ech_config };
     prioritize_preferred_upstream(state, &cache_key, &mut upstream.addrs).await;
+    log_upstream_debug(
+        state,
+        host,
+        "/",
+        &format!(
+            "resolve binding_host={binding_host} target_host={target_host} addrs={} ech={} edge_node={}",
+            format_socket_addrs(&upstream.addrs),
+            if upstream.ech_config.is_some() { "yes" } else { "no" },
+            state
+                .config
+                .edge_node_override()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or("-")
+        ),
+    );
     let resolve_ttl = min_duration_options(binding_ttl, min_duration_options(addr_ttl, extra_ttl))
         .unwrap_or(FALLBACK_RESOLVE_CACHE_TTL);
     write_cached_upstream(state, cache_key, upstream.clone(), resolve_ttl).await;
@@ -919,6 +1005,34 @@ fn parse_dns_host_override(raw: &str) -> Result<DnsHostOverride> {
     Ok(DnsHostOverride::Alias(value.to_string()))
 }
 
+fn should_trace_upstream(host: &str) -> bool {
+    matches!(
+        host.to_ascii_lowercase().as_str(),
+        "cdn3.linux.do" | "linux.do"
+    )
+}
+
+fn log_upstream_debug(state: &AppState, host: &str, path_and_query: &str, message: &str) {
+    if !should_trace_upstream(host) {
+        return;
+    }
+
+    let _ = runtime_log::append(
+        &state.paths,
+        "INFO",
+        "proxy-upstream",
+        &format!("host={host} path={path_and_query} {message}"),
+    );
+}
+
+fn format_socket_addrs(addrs: &[SocketAddr]) -> String {
+    addrs
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 fn parse_https_answer(raw_rdata: &str) -> Result<HttpsServiceBinding> {
     let bytes = parse_dns_json_hex_rdata(raw_rdata)?;
     if bytes.len() < 3 {
@@ -1136,7 +1250,10 @@ impl ServerCertVerifier for NoCertificateVerification {
     }
 }
 
-fn extract_host(headers: &HeaderMap, config: &AppConfig) -> Option<String> {
+fn extract_host(headers: &HeaderMap, uri: &http::Uri, config: &AppConfig) -> Option<String> {
+    uri.authority()
+        .map(|authority| authority.host().to_ascii_lowercase())
+        .or_else(|| {
     headers
         .get(HOST)
         .and_then(|value| value.to_str().ok())
@@ -1146,6 +1263,7 @@ fn extract_host(headers: &HeaderMap, config: &AppConfig) -> Option<String> {
                 .next()
                 .unwrap_or(value)
                 .to_ascii_lowercase()
+        })
         })
         .or_else(|| config.proxy_domains.first().cloned())
 }

@@ -100,7 +100,7 @@ pub async fn run_foreground(config_path: Option<PathBuf>, with_setup: bool) -> R
     let pid = std::process::id();
     state::write_pid(&paths, pid)?;
     state::mark_running(&paths, pid)?;
-    let result = run_proxy(config, bundle).await;
+    let result = run_proxy(config, paths.clone(), bundle).await;
     let _ = state::clear_pid_if_matches(&paths, pid);
     match &result {
         Ok(_) => {
