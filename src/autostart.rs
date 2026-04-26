@@ -32,16 +32,8 @@ fn enable_for_exe(exe: &Path, config_path: &Path) -> Result<()> {
 fn platform_enable(exe: &Path, config_path: &Path) -> Result<()> {
     use std::process::Command;
 
-    let exe = exe
-        .canonicalize()
-        .unwrap_or_else(|_| exe.to_path_buf())
-        .to_string_lossy()
-        .into_owned();
-    let config = config_path
-        .canonicalize()
-        .unwrap_or_else(|_| config_path.to_path_buf())
-        .to_string_lossy()
-        .into_owned();
+    let exe = absolute_display_path(exe);
+    let config = absolute_display_path(config_path);
     let value = format!(
         "\"{}\" --config \"{}\" {} gui",
         exe, config, AUTOSTART_FLAG
@@ -130,16 +122,8 @@ fn platform_enable(exe: &Path, config_path: &Path) -> Result<()> {
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
 
-    let exe = exe
-        .canonicalize()
-        .unwrap_or_else(|_| exe.to_path_buf())
-        .to_string_lossy()
-        .into_owned();
-    let config = config_path
-        .canonicalize()
-        .unwrap_or_else(|_| config_path.to_path_buf())
-        .to_string_lossy()
-        .into_owned();
+    let exe = absolute_display_path(exe);
+    let config = absolute_display_path(config_path);
     let plist = format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -231,8 +215,8 @@ fn platform_enable(exe: &Path, config_path: &Path) -> Result<()> {
 
     let exec = format!(
         "{} --config {} {} gui",
-        desktop_quote(&exe.to_string_lossy()),
-        desktop_quote(&config_path.to_string_lossy()),
+        desktop_quote(&absolute_display_path(exe)),
+        desktop_quote(&absolute_display_path(config_path)),
         AUTOSTART_FLAG,
     );
 
@@ -286,6 +270,33 @@ fn desktop_quote(value: &str) -> String {
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME").map(PathBuf::from)
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+fn absolute_display_path(path: &Path) -> String {
+    let resolved = path
+        .canonicalize()
+        .ok()
+        .or_else(|| std::path::absolute(path).ok())
+        .unwrap_or_else(|| path.to_path_buf());
+    let display = resolved.to_string_lossy().into_owned();
+    strip_extended_length_prefix(display)
+}
+
+#[cfg(target_os = "windows")]
+fn strip_extended_length_prefix(value: String) -> String {
+    if let Some(rest) = value.strip_prefix(r"\\?\UNC\") {
+        return format!(r"\\{rest}");
+    }
+    if let Some(rest) = value.strip_prefix(r"\\?\") {
+        return rest.to_string();
+    }
+    value
+}
+
+#[cfg(not(target_os = "windows"))]
+fn strip_extended_length_prefix(value: String) -> String {
+    value
 }
 
 #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
