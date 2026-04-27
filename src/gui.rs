@@ -42,7 +42,6 @@ const APP_VERSION: &str = match option_env!("LINUXDO_BUILD_VERSION") {
 };
 const ACTIVE_REPAINT_INTERVAL: Duration = Duration::from_millis(100);
 const IDLE_REPAINT_INTERVAL: Duration = Duration::from_secs(5);
-const TRAY_REPAINT_INTERVAL: Duration = Duration::from_secs(15);
 const EMBEDDED_CJK_FONT: &[u8] = include_bytes!("../assets/fonts/DroidSansFallbackFull.ttf");
 const LAUNCHER_CONTENT_SIZE: [f32; 2] = [620.0, 186.0];
 const DETAILS_WINDOW_SIZE: [f32; 2] = [760.0, 520.0];
@@ -1719,8 +1718,6 @@ impl AcceleratorApp {
     fn repaint_interval(&self) -> Duration {
         if self.busy || self.action_rx.is_some() || self.confirm_action.is_some() {
             ACTIVE_REPAINT_INTERVAL
-        } else if self.hidden_to_tray {
-            TRAY_REPAINT_INTERVAL
         } else {
             IDLE_REPAINT_INTERVAL
         }
@@ -1801,7 +1798,7 @@ impl eframe::App for AcceleratorApp {
         self.drag_blockers.clear();
 
         let repaint_interval = self.repaint_interval();
-        if self.last_refresh.elapsed() >= repaint_interval {
+        if !self.hidden_to_tray && self.last_refresh.elapsed() >= repaint_interval {
             self.refresh_status();
             self.last_refresh = Instant::now();
         }
@@ -1888,7 +1885,9 @@ impl eframe::App for AcceleratorApp {
 
         self.show_confirm_action_dialog(ctx);
 
-        ctx.request_repaint_after(repaint_interval);
+        if !self.hidden_to_tray {
+            ctx.request_repaint_after(repaint_interval);
+        }
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
