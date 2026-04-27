@@ -1587,7 +1587,7 @@ impl AcceleratorApp {
             let _ = tray.tray_icon.set_visible(true);
             self.hidden_to_tray = true;
             self.last_minimized = true;
-            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
             ctx.request_repaint();
         } else {
             self.feedback = "托盘不可用，已退回系统最小化".to_string();
@@ -1604,7 +1604,7 @@ impl AcceleratorApp {
             let _ = tray.control_tx.send(TrayVisibilityCommand::Show);
             self.hidden_to_tray = true;
             self.last_minimized = true;
-            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
             ctx.request_repaint();
         } else {
             self.feedback = "托盘不可用，已退回系统最小化".to_string();
@@ -1645,6 +1645,7 @@ impl AcceleratorApp {
         if let Some(tray) = &self.tray {
             let _ = tray.control_tx.send(TrayVisibilityCommand::Hide);
         }
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
         ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
         ctx.request_repaint();
@@ -1685,6 +1686,7 @@ impl AcceleratorApp {
         if let Some(tray) = &self.tray {
             let _ = tray.tray_icon.set_visible(false);
         }
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
         ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
         ctx.request_repaint();
@@ -1807,7 +1809,6 @@ impl eframe::App for AcceleratorApp {
         self.maybe_autostart();
 
         if self.current_page == UiPage::Launcher {
-            self.ensure_launcher_viewport(ctx);
             if self.center_window_pending {
                 if let Some(command) = egui::ViewportCommand::center_on_screen(ctx) {
                     ctx.send_viewport_cmd(command);
