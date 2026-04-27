@@ -32,11 +32,13 @@ def main() -> int:
             raise SystemExit(f"release tag must start with 'v': {raw_tag}")
         package_version = raw_tag[1:]
 
-    match = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)(?:[-+][0-9A-Za-z.-]+)?", package_version)
+    match = re.fullmatch(r"(\d+)\.(\d+)(?:\.(\d+))?(?:[-+][0-9A-Za-z.-]+)?", package_version)
     if not match:
         raise SystemExit(f"unsupported release version format: {package_version}")
 
-    major, minor, patch = (int(part) for part in match.groups())
+    major = int(match.group(1))
+    minor = int(match.group(2))
+    patch = int(match.group(3)) if match.group(3) else 0
     build_serial_raw = (os.environ.get("ANDROID_VERSION_SERIAL") or "").strip()
     if build_serial_raw:
         build_serial = int(build_serial_raw)
