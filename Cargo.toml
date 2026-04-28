@@ -102,3 +102,10 @@ winresource = "0.1"
 
 [patch.crates-io]
 egui-winit = { path = "vendor/egui-winit" }
+
+[profile.release]
+debug = true
+codegen-units = 1
+lto = "fat"
+opt-level = "s"
+panic = "abort"
