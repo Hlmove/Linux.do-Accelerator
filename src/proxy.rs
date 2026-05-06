@@ -403,24 +403,6 @@ async fn dispatch_upstream_request(
 
     let mut last_error = None;
     for addr in upstream.addrs.iter().copied() {
-        log_upstream_debug(
-            state,
-            request_host,
-            path_and_query,
-            &format!(
-                "attempt addr={addr} scheme={upstream_scheme} ech={} edge_node={}",
-                if upstream.ech_config.is_some() {
-                    "yes"
-                } else {
-                    "no"
-                },
-                state
-                    .config
-                    .edge_node_override()
-                    .filter(|value| !value.trim().is_empty())
-                    .unwrap_or("-")
-            ),
-        );
         match send_once(
             state,
             upstream_scheme,
@@ -437,28 +419,6 @@ async fn dispatch_upstream_request(
         {
             Ok(response) => {
                 remember_successful_upstream(state, request_host, upstream_port, addr).await;
-                let status = response.response.status();
-                let cf_ray = response
-                    .response
-                    .headers()
-                    .get("cf-ray")
-                    .and_then(|value| value.to_str().ok())
-                    .unwrap_or("-");
-                let content_type = response
-                    .response
-                    .headers()
-                    .get("content-type")
-                    .and_then(|value| value.to_str().ok())
-                    .unwrap_or("-");
-                log_upstream_debug(
-                    state,
-                    request_host,
-                    path_and_query,
-                    &format!(
-                        "success addr={addr} protocol={} status={} cf-ray={} content-type={}",
-                        response.negotiated_protocol, status, cf_ray, content_type
-                    ),
-                );
                 return Ok(response);
             }
             Err(error) => {
@@ -688,20 +648,6 @@ async fn resolve_upstream(state: &AppState, host: &str, port: u16) -> Result<Res
     if let Some(cached) = read_cached_upstream(state, &cache_key).await {
         let mut cached = cached;
         prioritize_preferred_upstream(state, &cache_key, &mut cached.addrs).await;
-        log_upstream_debug(
-            state,
-            host,
-            "/",
-            &format!(
-                "resolve cache-hit addrs={} ech={}",
-                format_socket_addrs(&cached.addrs),
-                if cached.ech_config.is_some() {
-                    "yes"
-                } else {
-                    "no"
-                }
-            ),
-        );
         return Ok(cached);
     }
 
@@ -806,25 +752,6 @@ async fn resolve_upstream(state: &AppState, host: &str, port: u16) -> Result<Res
 
     let mut upstream = upstream;
     prioritize_preferred_upstream(state, &cache_key, &mut upstream.addrs).await;
-    log_upstream_debug(
-        state,
-        host,
-        "/",
-        &format!(
-            "resolve binding_host={binding_host} target_host={target_host} addrs={} ech={} edge_node={}",
-            format_socket_addrs(&upstream.addrs),
-            if upstream.ech_config.is_some() {
-                "yes"
-            } else {
-                "no"
-            },
-            state
-                .config
-                .edge_node_override()
-                .filter(|value| !value.trim().is_empty())
-                .unwrap_or("-")
-        ),
-    );
     Ok(upstream)
 }
 
