@@ -29,7 +29,9 @@ use crate::paths::AppPaths;
 use crate::platform::run_elevated;
 use crate::platform::spawn_detached;
 #[cfg(target_os = "windows")]
-use crate::platform::{apply_app_window_icon, update_windows_shortcuts_for_exe};
+use crate::platform::{
+    apply_app_window_icon, hide_app_window, restore_app_window, update_windows_shortcuts_for_exe,
+};
 use crate::runtime_log::{append as append_runtime_log, read_recent_lines};
 use crate::service;
 use crate::state::{self, ServiceState};
@@ -1585,17 +1587,30 @@ impl AcceleratorApp {
     fn minimize_to_tray(&mut self, ctx: &egui::Context) {
         if let Some(tray) = &self.tray {
             let _ = tray.tray_icon.set_visible(true);
-            self.hidden_to_tray = true;
-            self.last_minimized = true;
-            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
-            ctx.request_repaint();
+            if let Some(hwnd) = self.window_handle {
+                match hide_app_window(hwnd) {
+                    Ok(()) => {
+                        self.hidden_to_tray = true;
+                        self.last_minimized = true;
+                        ctx.request_repaint();
+                        return;
+                    }
+                    Err(error) => {
+                        let _ = tray.tray_icon.set_visible(false);
+                        self.feedback = format!("托盘隐藏失败，已退回系统最小化: {error}");
+                    }
+                }
+            } else {
+                let _ = tray.tray_icon.set_visible(false);
+                self.feedback = "未获取到窗口句柄，已退回系统最小化".to_string();
+            }
         } else {
             self.feedback = "托盘不可用，已退回系统最小化".to_string();
-            self.hidden_to_tray = false;
-            self.last_minimized = true;
-            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
-            ctx.request_repaint();
         }
+        self.hidden_to_tray = false;
+        self.last_minimized = true;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+        ctx.request_repaint();
     }
 
     #[cfg(target_os = "linux")]
@@ -1680,13 +1695,37 @@ impl AcceleratorApp {
 
     #[cfg(target_os = "windows")]
     fn restore_from_tray(&mut self, ctx: &egui::Context) {
+        let mut restored = false;
+        let mut should_hide_tray = false;
+
+        if let Some(hwnd) = self.window_handle {
+            match restore_app_window(hwnd) {
+                Ok(()) => {
+                    restored = true;
+                    should_hide_tray = true;
+                }
+                Err(error) => {
+                    self.feedback = format!("托盘恢复失败，已尝试普通恢复: {error}");
+                }
+            }
+        }
+
+        if !restored {
+            should_hide_tray = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        } else {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        }
+
         self.hidden_to_tray = false;
         self.last_minimized = true;
-        if let Some(tray) = &self.tray {
-            let _ = tray.tray_icon.set_visible(false);
+        if should_hide_tray {
+            if let Some(tray) = &self.tray {
+                let _ = tray.tray_icon.set_visible(false);
+            }
         }
-        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
-        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
         ctx.request_repaint();
     }
 

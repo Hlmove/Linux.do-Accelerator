@@ -762,6 +762,9 @@ if (Get-Command ie4uinit.exe -ErrorAction SilentlyContinue) {{
 #[cfg(target_os = "windows")]
 pub fn hide_app_window(hwnd: isize) -> Result<()> {
     let hwnd = hwnd as HWND;
+    if hwnd.is_null() {
+        return Err(anyhow!("invalid window handle")).context("failed to hide app window");
+    }
     let shown = unsafe { ShowWindow(hwnd, SW_HIDE) };
     let _ = shown;
     Ok(())
@@ -770,6 +773,9 @@ pub fn hide_app_window(hwnd: isize) -> Result<()> {
 #[cfg(target_os = "windows")]
 pub fn restore_app_window(hwnd: isize) -> Result<()> {
     let hwnd = hwnd as HWND;
+    if hwnd.is_null() {
+        return Err(anyhow!("invalid window handle")).context("failed to restore app window");
+    }
     unsafe {
         ShowWindow(hwnd, SW_SHOW);
         ShowWindow(hwnd, SW_RESTORE);
